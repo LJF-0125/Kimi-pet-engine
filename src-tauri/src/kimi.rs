@@ -11,7 +11,7 @@
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 use std::fs;
 use std::time::{Duration, Instant};
@@ -26,6 +26,8 @@ const MAX_PORT_TRIES: u16 = 100; // 官方文档：端口占用时服务至多�
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 // 断线宽限：10 秒内保持原状态不灰化，超过仍未恢复才置为 offline
 const OFFLINE_GRACE: Duration = Duration::from_secs(10);
+// REST 轮询间隔：用 busy / pending_interaction 校准 WS 事件推断出的状态
+const POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PetState {
@@ -114,49 +116,96 @@ pub async fn web_url() -> Option<String> {
 
 /// 拉取会话 id 列表用于订阅（只拉第一页，超 100 个会话的极端情况会漏订阅，可接受）。
 async fn list_session_ids(client: &reqwest::Client, port: u16, token: &str) -> Vec<String> {
-    let mut ids = Vec::new();
+    fetch_sessions(client, port, token)
+        .await
+        .into_iter()
+        .map(|s| s.id)
+        .collect()
+}
+
+/// `agent.status.updated` 的 phase.kind → 单会话忙态；None 表示不影响状态。
+/// 未知的 kind 打日志，便于发现新枚举值。
+fn map_phase(phase: &Value) -> Option<SessionState> {
+    match phase.get("kind").and_then(|v| v.as_str())? {
+        // 思考中：agent 运行中、工具调用中
+        "running" | "tool_call" => Some(SessionState::Thinking),
+        // 流式输出：思考流算思考，正文流算回答
+        "streaming" => {
+            if phase.get("stream").and_then(|v| v.as_str()) == Some("thinking") {
+                Some(SessionState::Thinking)
+            } else {
+                Some(SessionState::Answering)
+            }
+        }
+        // 轮次结束 / 空闲
+        "idle" | "done" | "completed" => None,
+        other => {
+            eprintln!("[kimi-pet] 未知 phase kind：{other}");
+            None
+        }
+    }
+}
+
+struct SessionInfo {
+    id: String,
+    busy: bool,
+    pending: String,
+}
+
+/// 拉取会话列表（含忙态/待处理交互），用于订阅和状态校准。
+async fn fetch_sessions(client: &reqwest::Client, port: u16, token: &str) -> Vec<SessionInfo> {
+    let mut out = Vec::new();
     let url = format!("http://127.0.0.1:{port}/api/v1/sessions?page_size=100");
     if let Ok(resp) = client.get(&url).bearer_auth(token).send().await {
         if let Ok(envelope) = resp.json::<Value>().await {
             let data = envelope.get("data").cloned().unwrap_or(Value::Null);
-            // 兼容两种形状：data.items 或 data 直接是数组
             let items = data
                 .get("items")
                 .and_then(|v| v.as_array())
                 .or_else(|| data.as_array());
             if let Some(items) = items {
                 for it in items {
-                    if let Some(id) = it.get("id").and_then(|v| v.as_str()) {
-                        ids.push(id.to_string());
-                    }
+                    let Some(id) = it.get("id").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    out.push(SessionInfo {
+                        id: id.to_string(),
+                        busy: it.get("busy").and_then(|v| v.as_bool()).unwrap_or(false),
+                        pending: it
+                            .get("pending_interaction")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("none")
+                            .to_string(),
+                    });
                 }
             }
         }
     }
-    ids
+    out
 }
 
-/// 把会话事件类型映射为单会话忙态；None 表示不影响状态。
-fn map_event(event_type: &str) -> Option<SessionState> {
-    match event_type {
-        // 思考中：轮次开始、推理流、工具调用（按主人要求工具干活也算思考）
-        "turn.started" | "turn.step.started" | "thinking.delta" | "tool.call.started"
-        | "tool.call.delta" | "tool.progress" | "subagent.started" => Some(SessionState::Thinking),
-        // 回答中：正文流式输出
-        "assistant.delta" => Some(SessionState::Answering),
-        // 待审核
-        "event.approval.requested" | "event.question.requested" => Some(SessionState::Approval),
-        // 审批处理完，回到思考中
-        "event.approval.resolved" | "event.question.answered" | "event.question.dismissed" => {
-            Some(SessionState::Thinking)
+/// 用 REST 权威状态校准忙态表：待处理交互 > 忙碌 > 空闲。返回状态是否有变化。
+fn reconcile(sessions: &mut HashMap<String, SessionState>, infos: &[SessionInfo]) -> bool {
+    let mut changed = false;
+    for info in infos {
+        let prev = sessions.get(&info.id).copied();
+        let next = if !info.pending.is_empty() && info.pending != "none" {
+            Some(SessionState::Approval)
+        } else if info.busy {
+            // 不覆盖 WS 已给出的更细状态（Answering 等）
+            Some(prev.filter(|s| *s != SessionState::Approval).unwrap_or(SessionState::Thinking))
+        } else {
+            None
+        };
+        if prev != next {
+            changed = true;
+            match next {
+                Some(s) => sessions.insert(info.id.clone(), s),
+                None => sessions.remove(&info.id),
+            };
         }
-        _ => None,
     }
-}
-
-/// 轮次结束类事件（会话回到空闲，从忙态表移除）。
-fn is_turn_over(event_type: &str) -> bool {
-    matches!(event_type, "turn.ended" | "turn.step.interrupted" | "error")
+    changed
 }
 
 /// 聚合所有会话的忙态得到桌宠状态。
@@ -222,7 +271,7 @@ pub async fn run(app: AppHandle) {
             }
         }
 
-        let mut ws = match connect_async(request).await {
+        let ws = match connect_async(request).await {
             Ok((stream, _)) => stream,
             Err(e) => {
                 eprintln!("[kimi-pet] WS 连接失败（{url}）：{e}");
@@ -237,6 +286,7 @@ pub async fn run(app: AppHandle) {
         // 订阅当前所有会话的事件
         let client = reqwest::Client::new();
         let ids = list_session_ids(&client, port, &token).await;
+        let (mut ws_write, mut ws_read) = ws.split();
         if ids.is_empty() {
             eprintln!("[kimi-pet] 会话列表为空，仅接收全局事件");
         } else {
@@ -245,62 +295,124 @@ pub async fn run(app: AppHandle) {
                 "id": "sub-0",
                 "payload": { "session_ids": ids }
             });
-            if let Err(e) = ws.send(Message::text(frame.to_string())).await {
+            if let Err(e) = ws_write.send(Message::text(frame.to_string())).await {
                 eprintln!("[kimi-pet] 订阅帧发送失败：{e}");
             }
         }
+        let mut subscribed: HashSet<String> = ids.into_iter().collect();
 
         let mut sessions: HashMap<String, SessionState> = HashMap::new();
         set_state(&app, PetState::Idle);
+        let mut poll = tokio::time::interval(POLL_INTERVAL);
 
-        while let Some(msg) = ws.next().await {
-            let Ok(Message::Text(text)) = msg else {
-                if matches!(msg, Ok(Message::Close(_)) | Err(_)) {
-                    break;
+        loop {
+            tokio::select! {
+                msg = ws_read.next() => {
+                    let text = match msg {
+                        Some(Ok(Message::Text(t))) => t,
+                        // None / Close / Err 都视为连接断开
+                        None | Some(Ok(Message::Close(_))) | Some(Err(_)) => break,
+                        Some(Ok(_)) => continue,
+                    };
+                    let Ok(event) = serde_json::from_str::<Value>(&text) else {
+                        continue;
+                    };
+                    let Some(event_type) = event.get("type").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+
+                    // 应用层心跳：必须回 pong，否则服务端 30 秒左右掐线
+                    if event_type == "ping" {
+                        let frame = json!({
+                            "type": "pong",
+                            "payload": event.get("payload").cloned().unwrap_or(Value::Null)
+                        });
+                        let _ = ws_write.send(Message::text(frame.to_string())).await;
+                        continue;
+                    }
+
+                    // 全局事件：新会话创建时补订阅
+                    if event_type == "event.session.created" {
+                        let new_id = event
+                            .pointer("/payload/sessionId")
+                            .or_else(|| event.pointer("/payload/id"))
+                            .or_else(|| event.pointer("/payload/session_id"))
+                            .and_then(|v| v.as_str());
+                        match new_id {
+                            Some(id) => {
+                                let frame = json!({
+                                    "type": "subscribe",
+                                    "payload": { "session_ids": [id] }
+                                });
+                                if let Err(e) = ws_write.send(Message::text(frame.to_string())).await {
+                                    eprintln!("[kimi-pet] 补订阅 {id} 失败：{e}");
+                                } else {
+                                    subscribed.insert(id.to_string());
+                                }
+                            }
+                            None => eprintln!("[kimi-pet] event.session.created 未解析到会话 id：{text}"),
+                        }
+                        continue;
+                    }
+
+                    // 会话事件：按 session_id 维护忙态表并聚合
+                    let Some(session_id) = event.get("session_id").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    match event_type {
+                        // agent 自报阶段：状态的主要来源
+                        "agent.status.updated" => {
+                            if let Some(phase) = event.pointer("/payload/phase") {
+                                match map_phase(phase) {
+                                    Some(s) => sessions.insert(session_id.to_string(), s),
+                                    None => sessions.remove(session_id),
+                                };
+                                set_state(&app, aggregate(&sessions));
+                            }
+                        }
+                        // 待审核
+                        "event.approval.requested" | "event.question.requested" => {
+                            sessions.insert(session_id.to_string(), SessionState::Approval);
+                            set_state(&app, aggregate(&sessions));
+                        }
+                        // 审批处理完，回到思考中
+                        "event.approval.resolved" | "event.question.answered"
+                        | "event.question.dismissed" => {
+                            sessions.insert(session_id.to_string(), SessionState::Thinking);
+                            set_state(&app, aggregate(&sessions));
+                        }
+                        // 轮次结束
+                        "turn.ended" | "turn.step.interrupted" | "error" => {
+                            sessions.remove(session_id);
+                            set_state(&app, aggregate(&sessions));
+                        }
+                        _ => {}
+                    }
                 }
-                continue;
-            };
-            let Ok(event) = serde_json::from_str::<Value>(&text) else {
-                continue;
-            };
-            let Some(event_type) = event.get("type").and_then(|v| v.as_str()) else {
-                continue;
-            };
-
-            // 全局事件：新会话创建时补订阅
-            if event_type == "event.session.created" {
-                let new_id = event
-                    .pointer("/payload/sessionId")
-                    .or_else(|| event.pointer("/payload/id"))
-                    .or_else(|| event.pointer("/payload/session_id"))
-                    .and_then(|v| v.as_str());
-                match new_id {
-                    Some(id) => {
+                _ = poll.tick() => {
+                    // REST 轮询校准：兜底漏事件/卡状态；顺带补订阅新会话
+                    let infos = fetch_sessions(&client, port, &token).await;
+                    if reconcile(&mut sessions, &infos) {
+                        set_state(&app, aggregate(&sessions));
+                    }
+                    let new_ids: Vec<String> = infos
+                        .iter()
+                        .map(|i| i.id.clone())
+                        .filter(|id| !subscribed.contains(id))
+                        .collect();
+                    if !new_ids.is_empty() {
                         let frame = json!({
                             "type": "subscribe",
-                            "payload": { "session_ids": [id] }
+                            "payload": { "session_ids": new_ids }
                         });
-                        if let Err(e) = ws.send(Message::text(frame.to_string())).await {
-                            eprintln!("[kimi-pet] 补订阅 {id} 失败：{e}");
+                        if let Err(e) = ws_write.send(Message::text(frame.to_string())).await {
+                            eprintln!("[kimi-pet] 补订阅失败：{e}");
+                        } else {
+                            subscribed.extend(new_ids);
                         }
                     }
-                    None => eprintln!("[kimi-pet] event.session.created 未解析到会话 id：{text}"),
                 }
-                continue;
             }
-
-            // 会话事件：按 session_id 维护忙态表并聚合
-            let Some(session_id) = event.get("session_id").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            if is_turn_over(event_type) {
-                sessions.remove(session_id);
-            } else if let Some(state) = map_event(event_type) {
-                sessions.insert(session_id.to_string(), state);
-            } else {
-                continue;
-            }
-            set_state(&app, aggregate(&sessions));
         }
 
         eprintln!("[kimi-pet] WS 连接断开，{RETRY_DELAY:?} 后重连");
