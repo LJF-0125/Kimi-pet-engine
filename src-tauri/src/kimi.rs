@@ -194,7 +194,7 @@ pub async fn run(app: AppHandle) {
         };
 
         let url = format!("ws://127.0.0.1:{port}/api/v1/ws");
-        let Ok(mut request) = url.into_client_request() else {
+        let Ok(mut request) = url.clone().into_client_request() else {
             eprintln!("[kimi-pet] 构造 WS 请求失败：{url}");
             tokio::time::sleep(RETRY_DELAY).await;
             continue;
