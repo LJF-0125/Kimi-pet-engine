@@ -2,12 +2,12 @@
 //!
 //! 状态（发给前端的 `pet-state` 事件，payload 为字符串）：
 //! - `thinking`  思考中：轮次开始 / 推理中 / 工具调用中
-//! - `answering` 回答中：正在流式输出正文
+//! - `answering` 编辑中：正在流式输出正文
 //! - `approval`  待审核：等待用户处理审批或提问
 //! - `idle`      空闲中：无活动轮次（含一轮结束），也是初始状态
 //! - `offline`   kimi web 服务不在线
 //!
-//! 多会话并发时按会话聚合：任一待审核 > 任一回答中 > 任一思考中 > 全空闲。
+//! 多会话并发时按会话聚合：任一待审核 > 任一编辑中 > 任一思考中 > 全空闲。
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
