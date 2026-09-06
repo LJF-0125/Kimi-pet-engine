@@ -13,7 +13,8 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
-use std::{fs, time::Duration};
+use std::fs;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 use tokio_tungstenite::{
     connect_async,
@@ -23,6 +24,8 @@ use tokio_tungstenite::{
 const BASE_PORT: u16 = 58627;
 const MAX_PORT_TRIES: u16 = 100; // 官方文档：端口占用时服务至多递增重试 100 次
 const RETRY_DELAY: Duration = Duration::from_secs(5);
+// 断线宽限：10 秒内保持原状态不灰化，超过仍未恢复才置为 offline
+const OFFLINE_GRACE: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PetState {
@@ -173,21 +176,30 @@ fn aggregate(sessions: &HashMap<String, SessionState>) -> PetState {
     result
 }
 
+/// 记录断线时刻：宽限期内保持原状态，超过 OFFLINE_GRACE 仍未恢复才置为离线。
+fn mark_disconnected(app: &AppHandle, since: &mut Option<Instant>) {
+    let start = since.get_or_insert_with(Instant::now);
+    if start.elapsed() >= OFFLINE_GRACE {
+        set_state(app, PetState::Offline);
+    }
+}
+
 /// 主循环：发现服务 → 连 WebSocket → 消费事件；断线自动重连。
 pub async fn run(app: AppHandle) {
+    let mut disconnected_since: Option<Instant> = None;
     loop {
-        // 发现服务（每次探测失败都刷新 offline，保证启动早期 listen 未注册时状态也能被拉到）
+        // 发现服务（宽限期内保持原状态，超过 OFFLINE_GRACE 仍未恢复才灰化）
         let (token, port) = loop {
             match (read_token(), find_port().await) {
                 (Some(token), Some(port)) => break (token, port),
                 (None, _) => {
                     eprintln!("[kimi-pet] 未找到 ~/.kimi-code/server.token，{RETRY_DELAY:?} 后重试");
-                    set_state(&app, PetState::Offline);
+                    mark_disconnected(&app, &mut disconnected_since);
                     tokio::time::sleep(RETRY_DELAY).await;
                 }
                 (Some(_), None) => {
                     eprintln!("[kimi-pet] 未发现 kimi web 服务（{BASE_PORT} 起 {MAX_PORT_TRIES} 个端口均无响应），{RETRY_DELAY:?} 后重试");
-                    set_state(&app, PetState::Offline);
+                    mark_disconnected(&app, &mut disconnected_since);
                     tokio::time::sleep(RETRY_DELAY).await;
                 }
             }
@@ -214,12 +226,13 @@ pub async fn run(app: AppHandle) {
             Ok((stream, _)) => stream,
             Err(e) => {
                 eprintln!("[kimi-pet] WS 连接失败（{url}）：{e}");
-                set_state(&app, PetState::Offline);
+                mark_disconnected(&app, &mut disconnected_since);
                 tokio::time::sleep(RETRY_DELAY).await;
                 continue;
             }
         };
         eprintln!("[kimi-pet] 已连接 kimi web（端口 {port}）");
+        disconnected_since = None;
 
         // 订阅当前所有会话的事件
         let client = reqwest::Client::new();
@@ -291,7 +304,7 @@ pub async fn run(app: AppHandle) {
         }
 
         eprintln!("[kimi-pet] WS 连接断开，{RETRY_DELAY:?} 后重连");
-        set_state(&app, PetState::Offline);
+        mark_disconnected(&app, &mut disconnected_since);
         tokio::time::sleep(RETRY_DELAY).await;
     }
 }
