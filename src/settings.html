@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>桌宠设置</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 20px;
+      font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: #f6f7f9;
+      color: #333;
+    }
+    h1 { font-size: 18px; margin: 0 0 4px; }
+    .tip { font-size: 12px; color: #888; margin-bottom: 16px; }
+    .row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      background: #fff;
+      border: 1px solid #e5e6ea;
+      border-radius: 10px;
+      padding: 12px;
+      margin-bottom: 10px;
+    }
+    .label { width: 64px; font-weight: 600; flex-shrink: 0; }
+    .preview {
+      width: 64px;
+      height: 64px;
+      flex-shrink: 0;
+      border-radius: 8px;
+      background: repeating-conic-gradient(#ddd 0 25%, #fff 0 50%) 0 0 / 16px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      font-size: 24px;
+    }
+    .preview img { max-width: 100%; max-height: 100%; }
+    .actions { margin-left: auto; display: flex; gap: 8px; }
+    button {
+      border: 1px solid #d0d3d9;
+      background: #fff;
+      border-radius: 8px;
+      padding: 6px 12px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    button:hover { background: #f0f1f4; }
+  </style>
+</head>
+<body>
+  <h1>桌宠 GIF 设置</h1>
+  <p class="tip">为每种状态选一张透明底 GIF；未设置的状态会沿用「空闲中」的 GIF。保存后桌宠即时生效。</p>
+  <div id="rows"></div>
+
+  <script>
+    const { emit } = window.__TAURI__.event;
+
+    const STATES = [
+      ["thinking", "思考中"],
+      ["answering", "回答中"],
+      ["approval", "待审核"],
+      ["idle", "空闲中"],
+    ];
+
+    // ---- IndexedDB（与桌宠窗口共享）----
+    function idb() {
+      return new Promise((resolve, reject) => {
+        const req = indexedDB.open("kimi-pet", 1);
+        req.onupgradeneeded = () => req.result.createObjectStore("gifs");
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+    }
+    async function idbGet(key) {
+      const db = await idb();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction("gifs", "readonly").objectStore("gifs").get(key);
+        tx.onsuccess = () => resolve(tx.result || null);
+        tx.onerror = () => reject(tx.error);
+      });
+    }
+    async function idbPut(key, value) {
+      const db = await idb();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction("gifs", "readwrite").objectStore("gifs").put(value, key);
+        tx.onsuccess = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    }
+    async function idbDel(key) {
+      const db = await idb();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction("gifs", "readwrite").objectStore("gifs").delete(key);
+        tx.onsuccess = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    }
+
+    // ---- 界面 ----
+    const rows = document.getElementById("rows");
+    const previews = {};
+
+    for (const [key, label] of STATES) {
+      const row = document.createElement("div");
+      row.className = "row";
+      row.innerHTML = `
+        <div class="label">${label}</div>
+        <div class="preview"><span>🐾</span></div>
+        <div class="actions">
+          <button data-act="pick">选择 GIF</button>
+          <button data-act="clear">清除</button>
+        </div>
+      `;
+      const preview = row.querySelector(".preview");
+      previews[key] = preview;
+
+      const input = document.createElement("input");
+      input.type = "file";
+      input.accept = ".gif,image/gif";
+      input.style.display = "none";
+      input.addEventListener("change", async () => {
+        const file = input.files[0];
+        if (!file) return;
+        await idbPut(key, file);
+        showPreview(key, file);
+        await emit("gifs-updated");
+        input.value = "";
+      });
+
+      row.querySelector('[data-act="pick"]').addEventListener("click", () => input.click());
+      row.querySelector('[data-act="clear"]').addEventListener("click", async () => {
+        await idbDel(key);
+        showPreview(key, null);
+        await emit("gifs-updated");
+      });
+
+      row.appendChild(input);
+      rows.appendChild(row);
+    }
+
+    const previewUrls = {}; // key -> 当前预览的 objectURL，替换时释放
+
+    function showPreview(key, blob) {
+      const box = previews[key];
+      if (previewUrls[key]) {
+        URL.revokeObjectURL(previewUrls[key]);
+        previewUrls[key] = null;
+      }
+      box.innerHTML = "";
+      if (blob) {
+        const img = document.createElement("img");
+        previewUrls[key] = URL.createObjectURL(blob);
+        img.src = previewUrls[key];
+        box.appendChild(img);
+      } else {
+        box.innerHTML = "<span>🐾</span>";
+      }
+    }
+
+    // 载入已保存的 GIF
+    for (const [key] of STATES) {
+      idbGet(key).then((blob) => showPreview(key, blob));
+    }
+  </script>
+</body>
+</html>

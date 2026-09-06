@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>kimi-pet</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      background: transparent;
+      overflow: hidden;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    #stage {
+      width: 100%;
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: grab;
+    }
+    #pet {
+      max-width: 100%;
+      max-height: 100%;
+      pointer-events: none; /* 鼠标事件由 stage 统一处理 */
+    }
+    #stage.offline #pet,
+    #stage.offline #placeholder {
+      filter: grayscale(1) opacity(0.45);
+    }
+    #placeholder {
+      display: none;
+      font-size: 64px;
+      text-align: center;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="stage" data-tauri-drag-region>
+    <img id="pet" alt="" draggable="false" />
+    <div id="placeholder">🐾</div>
+  </div>
+
+  <script>
+    const { invoke } = window.__TAURI__.core;
+    const { listen } = window.__TAURI__.event;
+    const { openUrl } = window.__TAURI__.opener;
+
+    // ---- IndexedDB：按状态名存 GIF 二进制（设置窗口写入，这里读取）----
+    const STATES = ["thinking", "answering", "approval", "idle"];
+
+    function idb() {
+      return new Promise((resolve, reject) => {
+        const req = indexedDB.open("kimi-pet", 1);
+        req.onupgradeneeded = () => req.result.createObjectStore("gifs");
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+    }
+    async function idbGet(key) {
+      const db = await idb();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction("gifs", "readonly").objectStore("gifs").get(key);
+        tx.onsuccess = () => resolve(tx.result || null);
+        tx.onerror = () => reject(tx.error);
+      });
+    }
+
+    // ---- 状态 -> GIF ----
+    const stage = document.getElementById("stage");
+    const pet = document.getElementById("pet");
+    const placeholder = document.getElementById("placeholder");
+    const urls = {}; // state -> objectURL
+    let currentState = "idle";
+    let offline = false;
+
+    async function loadGifs() {
+      for (const state of STATES) {
+        const blob = await idbGet(state);
+        if (urls[state]) URL.revokeObjectURL(urls[state]);
+        urls[state] = blob ? URL.createObjectURL(blob) : null;
+      }
+      render();
+    }
+
+    function render() {
+      const url = urls[currentState] || urls.idle;
+      if (url) {
+        pet.src = url;
+        pet.style.display = "";
+        placeholder.style.display = "none";
+      } else {
+        pet.style.display = "none";
+        placeholder.style.display = "";
+      }
+      stage.classList.toggle("offline", offline);
+    }
+
+    function applyState(state) {
+      if (state === "offline") {
+        offline = true;
+      } else {
+        offline = false;
+        currentState = STATES.includes(state) ? state : "idle";
+      }
+      render();
+    }
+
+    // 设置窗口保存后刷新
+    listen("gifs-updated", loadGifs);
+
+    // ---- 交互：拖动（data-tauri-drag-region）、双击开 web、右键开设置 ----
+    stage.addEventListener("dblclick", async () => {
+      const url = await invoke("web_url");
+      if (url) await openUrl(url);
+    });
+    stage.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      invoke("open_settings");
+    });
+
+    loadGifs();
+    // listen 注册完成后主动拉一次当前状态，补上注册前可能丢掉的 emit
+    listen("pet-state", (e) => applyState(e.payload)).then(() => {
+      invoke("get_state").then(applyState);
+    });
+  </script>
+</body>
+</html>
