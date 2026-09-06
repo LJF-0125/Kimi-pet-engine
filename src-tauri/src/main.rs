@@ -17,16 +17,15 @@ fn get_state() -> &'static str {
     kimi::current_state()
 }
 
-/// 右键桌宠：打开设置窗口。
-#[tauri::command]
-async fn open_settings(app: tauri::AppHandle) {
+/// 打开（或聚焦）设置窗口。
+fn show_settings(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("settings") {
         let _ = w.show();
         let _ = w.set_focus();
         return;
     }
     let _ = tauri::WebviewWindowBuilder::new(
-        &app,
+        app,
         "settings",
         tauri::WebviewUrl::App("settings.html".into()),
     )
@@ -36,22 +35,48 @@ async fn open_settings(app: tauri::AppHandle) {
     .build();
 }
 
+/// 右键桌宠：打开设置窗口。
+#[tauri::command]
+async fn open_settings(app: tauri::AppHandle) {
+    show_settings(&app);
+}
+
+/// 托盘回调在事件循环线程上，直接建窗口可能死锁（同同步命令的坑），丢到异步运行时。
+fn spawn_show_settings(app: &tauri::AppHandle) {
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        show_settings(&handle);
+    });
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![web_url, get_state, open_settings])
         .setup(|app| {
-            // 系统托盘：右键 → 退出
+            // 系统托盘：左键单击 → 设置；右键菜单 → 桌宠设置 / 退出
+            let settings = tauri::menu::MenuItem::with_id(app, "settings", "桌宠设置", true, None::<&str>)?;
             let quit = tauri::menu::MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-            let menu = tauri::menu::Menu::with_items(app, &[&quit])?;
+            let menu = tauri::menu::Menu::with_items(app, &[&settings, &quit])?;
             let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png"))?;
             tauri::tray::TrayIconBuilder::new()
                 .icon(icon)
                 .tooltip("kimi-pet")
                 .menu(&menu)
-                .on_menu_event(|app, event| {
-                    if event.id.as_ref() == "quit" {
-                        app.exit(0);
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "settings" => spawn_show_settings(app),
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let tauri::tray::TrayIconEvent::Click {
+                        button: tauri::tray::MouseButton::Left,
+                        button_state: tauri::tray::MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        spawn_show_settings(tray.app_handle());
                     }
                 })
                 .build(app)?;
