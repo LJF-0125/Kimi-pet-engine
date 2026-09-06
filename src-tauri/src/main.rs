@@ -19,7 +19,7 @@ fn get_state() -> &'static str {
 
 /// 右键桌宠：打开设置窗口。
 #[tauri::command]
-fn open_settings(app: tauri::AppHandle) {
+async fn open_settings(app: tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("settings") {
         let _ = w.show();
         let _ = w.set_focus();
