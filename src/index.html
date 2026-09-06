@@ -79,7 +79,14 @@
 
     async function loadGifs() {
       for (const state of STATES) {
-        const blob = await idbGet(state);
+        let blob = await idbGet(state);
+        if (!blob) {
+          // 未上传过：回落到内置默认 GIF
+          try {
+            const resp = await fetch(`default-gifs/${state}.gif`);
+            if (resp.ok) blob = await resp.blob();
+          } catch (_) {}
+        }
         if (urls[state]) URL.revokeObjectURL(urls[state]);
         urls[state] = blob ? URL.createObjectURL(blob) : null;
       }

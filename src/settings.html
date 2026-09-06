@@ -159,9 +159,17 @@
       }
     }
 
-    // 载入已保存的 GIF
+    // 载入已保存的 GIF；未设置的显示内置默认图预览
     for (const [key] of STATES) {
-      idbGet(key).then((blob) => showPreview(key, blob));
+      idbGet(key).then(async (blob) => {
+        if (!blob) {
+          try {
+            const resp = await fetch(`default-gifs/${key}.gif`);
+            if (resp.ok) blob = await resp.blob();
+          } catch (_) {}
+        }
+        showPreview(key, blob);
+      });
     }
   </script>
 </body>
