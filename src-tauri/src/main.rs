@@ -41,6 +41,21 @@ fn main() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![web_url, get_state, open_settings])
         .setup(|app| {
+            // 系统托盘：右键 → 退出
+            let quit = tauri::menu::MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+            let menu = tauri::menu::Menu::with_items(app, &[&quit])?;
+            let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png"))?;
+            tauri::tray::TrayIconBuilder::new()
+                .icon(icon)
+                .tooltip("kimi-pet")
+                .menu(&menu)
+                .on_menu_event(|app, event| {
+                    if event.id.as_ref() == "quit" {
+                        app.exit(0);
+                    }
+                })
+                .build(app)?;
+
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(kimi::run(handle));
             Ok(())
