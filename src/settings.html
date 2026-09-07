@@ -50,8 +50,14 @@
   </style>
 </head>
 <body>
-  <h1>桌宠 GIF 设置</h1>
-  <p class="tip">为每种状态选一张透明底 GIF；未设置的状态会沿用「空闲中」的 GIF。保存后桌宠即时生效。</p>
+  <h1>桌宠设置</h1>
+  <p class="tip">拖动滑块调整桌宠大小，即时生效、自动保存。</p>
+  <div class="row">
+    <div class="label">大小</div>
+    <input type="range" id="scale" min="50" max="250" step="5" value="100" style="flex: 1" />
+    <span id="scale-val" style="width: 44px; text-align: right">100%</span>
+  </div>
+  <p class="tip">为每种状态选一张透明底 GIF；未设置的状态会沿用「空闲中」的 GIF。</p>
   <div id="rows"></div>
 
   <script>
@@ -171,6 +177,21 @@
         showPreview(key, blob);
       });
     }
+
+    // ---- 大小滑块：比例存 IndexedDB（键 scale），桌宠窗口监听 scale-updated 后改窗口尺寸 ----
+    const scaleInput = document.getElementById("scale");
+    const scaleVal = document.getElementById("scale-val");
+    idbGet("scale").then((s) => {
+      const pct = Math.round((s || 1) * 100);
+      scaleInput.value = pct;
+      scaleVal.textContent = pct + "%";
+    });
+    scaleInput.addEventListener("input", async () => {
+      const pct = Number(scaleInput.value);
+      scaleVal.textContent = pct + "%";
+      await idbPut("scale", pct / 100);
+      await emit("scale-updated");
+    });
   </script>
 </body>
 </html>

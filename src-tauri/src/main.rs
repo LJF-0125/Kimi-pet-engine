@@ -30,7 +30,7 @@ fn show_settings(app: &tauri::AppHandle) {
         tauri::WebviewUrl::App("settings.html".into()),
     )
     .title("桌宠设置")
-    .inner_size(520.0, 460.0)
+    .inner_size(520.0, 540.0)
     .resizable(true)
     .build();
 }
@@ -39,6 +39,16 @@ fn show_settings(app: &tauri::AppHandle) {
 #[tauri::command]
 async fn open_settings(app: tauri::AppHandle) {
     show_settings(&app);
+}
+
+/// 调整桌宠大小：按 tauri.conf.json 的基准尺寸 220x220 等比缩放主窗口，
+/// 让可拖动/遮挡区域始终和 GIF 视觉大小一致。
+#[tauri::command]
+fn set_scale(app: tauri::AppHandle, scale: f64) {
+    if let Some(w) = app.get_webview_window("main") {
+        let scale = scale.clamp(0.5, 2.5);
+        let _ = w.set_size(tauri::LogicalSize::new(220.0 * scale, 220.0 * scale));
+    }
 }
 
 /// 托盘回调在事件循环线程上，直接建窗口可能死锁（同同步命令的坑），丢到异步运行时。
@@ -52,7 +62,7 @@ fn spawn_show_settings(app: &tauri::AppHandle) {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![web_url, get_state, open_settings])
+        .invoke_handler(tauri::generate_handler![web_url, get_state, open_settings, set_scale])
         .setup(|app| {
             // 系统托盘：左键单击 → 设置；右键菜单 → 桌宠设置 / 退出
             let settings = tauri::menu::MenuItem::with_id(app, "settings", "桌宠设置", true, None::<&str>)?;
