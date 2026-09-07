@@ -90,18 +90,50 @@ fn read_token() -> Option<String> {
     }
 }
 
-/// 从默认端口起探测本地 kimi web 服务（healthz 无需鉴权）。
+/// 读取 `~/.kimi-code/server/instances/*.json` 中各实例自报的端口。
+/// 新版服务的端口可能落在默认扫描范围之外，会把实际端口写进实例清单；
+/// 文件可能来自已退出的实例，返回的端口仍需 healthz 验证。
+fn instance_ports() -> Vec<u16> {
+    let mut ports = Vec::new();
+    let Some(dir) = dirs::home_dir().map(|h| h.join(".kimi-code").join("server").join("instances")) else {
+        return ports;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return ports;
+    };
+    for entry in entries.flatten() {
+        let Ok(text) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        if let Some(port) = v.get("port").and_then(|p| p.as_u64()).and_then(|p| u16::try_from(p).ok()) {
+            ports.push(port);
+        }
+    }
+    ports
+}
+
+async fn healthz_ok(client: &reqwest::Client, port: u16) -> bool {
+    let url = format!("http://127.0.0.1:{port}/api/v1/healthz");
+    matches!(client.get(&url).send().await, Ok(resp) if resp.status().is_success())
+}
+
+/// 发现本地 kimi web 服务：先按实例清单（服务自报端口）探测，再从默认端口起扫描。
 async fn find_port() -> Option<u16> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(800))
         .build()
         .ok()?;
+    for port in instance_ports() {
+        if healthz_ok(&client, port).await {
+            return Some(port);
+        }
+    }
     for port in BASE_PORT..BASE_PORT + MAX_PORT_TRIES {
-        let url = format!("http://127.0.0.1:{port}/api/v1/healthz");
-        if let Ok(resp) = client.get(&url).send().await {
-            if resp.status().is_success() {
-                return Some(port);
-            }
+        if healthz_ok(&client, port).await {
+            return Some(port);
         }
     }
     None
