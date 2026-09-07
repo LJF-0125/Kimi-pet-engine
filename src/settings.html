@@ -57,11 +57,19 @@
     <input type="range" id="scale" min="50" max="250" step="5" value="100" style="flex: 1" />
     <span id="scale-val" style="width: 44px; text-align: right">100%</span>
   </div>
+  <div class="row">
+    <div class="label">启动</div>
+    <label style="flex: 1; font-size: 13px; display: flex; align-items: center; gap: 6px; cursor: pointer">
+      <input type="checkbox" id="launch-hook" /> 跟随 Kimi Code 启动
+    </label>
+  </div>
+  <p class="tip">勾选后会自动往 ~/.kimi-code/config.toml 写入 SessionStart 钩子（取消则移除），之后每次 Kimi Code 开会话都会自动拉起桌宠。</p>
   <p class="tip">为每种状态选一张透明底 GIF；未设置的状态会沿用「空闲中」的 GIF。</p>
   <div id="rows"></div>
 
   <script>
     const { emit } = window.__TAURI__.event;
+    const { invoke } = window.__TAURI__.core;
 
     const STATES = [
       ["thinking", "思考中"],
@@ -191,6 +199,18 @@
       scaleVal.textContent = pct + "%";
       await idbPut("scale", pct / 100);
       await emit("scale-updated");
+    });
+
+    // ---- 跟随启动勾选：状态以 config.toml 里是否存在 hook 为准（见 launch_hook.rs）----
+    const launchHook = document.getElementById("launch-hook");
+    invoke("get_launch_hook").then((on) => { launchHook.checked = !!on; });
+    launchHook.addEventListener("change", async () => {
+      try {
+        await invoke("set_launch_hook", { enabled: launchHook.checked });
+      } catch (e) {
+        launchHook.checked = !launchHook.checked;
+        alert("更新配置失败：" + e);
+      }
     });
   </script>
 </body>
