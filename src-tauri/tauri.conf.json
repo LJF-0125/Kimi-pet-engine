@@ -37,5 +37,16 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "PASTE_PUBLIC_KEY_HERE",
+      "endpoints": [
+        "https://github.com/LJF-0125/Kimi-pet-engine/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

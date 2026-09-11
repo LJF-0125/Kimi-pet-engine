@@ -4,6 +4,7 @@
 mod edge_hide;
 mod kimi;
 mod launch_hook;
+mod updater;
 
 use tauri::Manager;
 
@@ -66,6 +67,8 @@ fn main() {
         // 单实例：hook / 手动重复启动时只保留先运行的实例
         .plugin(tauri_plugin_single_instance::init(|_app, _args, _cwd| {}))
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             web_url,
             get_state,
@@ -113,6 +116,7 @@ fn main() {
 
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(kimi::run(handle));
+            updater::start(app.handle().clone());
             Ok(())
         })
         .run(tauri::generate_context!())

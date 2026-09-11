@@ -4,7 +4,10 @@ Kimi Code 桌宠：一个常驻桌面的透明小窗，跟着本机 `kimi web` �
 
 ## 下载（Windows x64）
 
-到 [Releases](https://github.com/LJF-0125/Kimi-pet-engine/releases) 下载最新的 `kimi-pet.exe`，双击即用，内置默认形象，无需任何配置。
+到 [Releases](https://github.com/LJF-0125/Kimi-pet-engine/releases) 下载：
+
+- **`kimi-pet_*_x64-setup.exe`（推荐）**：NSIS 安装包，安装版支持应用内自动更新——检测到新版本会弹窗提示，点「立即更新」自动下载安装并重启。
+- **`kimi-pet.exe`**：绿色单文件，双击即用，内置默认形象，无需任何配置；不支持自动更新，需手动下载新版覆盖。
 
 > 未签名软件的正常提示：Edge 下载时若提示"通常不会下载"，点 `...` → **保留** → **仍然保留**；
 > 运行时若弹"Windows 已保护你的电脑"，点 **更多信息** → **仍要运行**。
@@ -66,6 +69,10 @@ cargo build --release   # 单文件 exe 在 target/release/kimi-pet.exe
 
 也可以用 `cargo tauri build` 出安装包（产物在 `src-tauri/target/release/bundle/`），
 或推到 GitHub 后用 `tauri-apps/tauri-action` 同时出 macOS 和 Windows 安装包。
+
+自动更新：在仓库 Secrets 配置 `TAURI_SIGNING_PRIVATE_KEY`（及密码，若设置了的话）后，
+tauri-action 会自动给更新包签名并生成 `latest.json` 挂到 release；
+客户端按 `tauri.conf.json` 里的 `plugins.updater.pubkey` 验签，公钥与私钥要配对。
 
 ## 使用前提
 
