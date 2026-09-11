@@ -73,6 +73,7 @@ cargo build --release   # 单文件 exe 在 target/release/kimi-pet.exe
 自动更新：在仓库 Secrets 配置 `TAURI_SIGNING_PRIVATE_KEY`（及密码，若设置了的话）后，
 tauri-action 会自动给更新包签名并生成 `latest.json` 挂到 release；
 客户端按 `tauri.conf.json` 里的 `plugins.updater.pubkey` 验签，公钥与私钥要配对。
+密钥的生成与配置步骤见 [docs/updater-signing.md](docs/updater-signing.md)。
 
 ## 使用前提
 
