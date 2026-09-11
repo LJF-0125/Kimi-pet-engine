@@ -1,6 +1,7 @@
 // release 构建不带控制台窗口；debug 保留控制台方便看日志
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod edge_hide;
 mod kimi;
 mod launch_hook;
 
@@ -31,7 +32,7 @@ fn show_settings(app: &tauri::AppHandle) {
         tauri::WebviewUrl::App("settings.html".into()),
     )
     .title("桌宠设置")
-    .inner_size(520.0, 590.0)
+    .inner_size(520.0, 650.0)
     .resizable(true)
     .build();
 }
@@ -71,7 +72,9 @@ fn main() {
             open_settings,
             set_scale,
             launch_hook::get_launch_hook,
-            launch_hook::set_launch_hook
+            launch_hook::set_launch_hook,
+            edge_hide::get_edge_hide,
+            edge_hide::set_edge_hide
         ])
         .setup(|app| {
             // 系统托盘：左键单击 → 设置；右键菜单 → 桌宠设置 / 退出
@@ -100,6 +103,11 @@ fn main() {
                     }
                 })
                 .build(app)?;
+
+            // 贴边自动隐藏：监听主窗口的移动/悬停事件
+            if let Some(w) = app.get_webview_window("main") {
+                edge_hide::attach(&w);
+            }
 
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(kimi::run(handle));

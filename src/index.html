@@ -127,6 +127,14 @@
     listen("scale-updated", applyScale);
     applyScale();
 
+    // ---- 贴边自动隐藏：开关存 IndexedDB（键 edgeHide），同步给 Rust 端 ----
+    async function applyEdgeHide() {
+      const on = await idbGet("edgeHide");
+      invoke("set_edge_hide", { enabled: on === null ? true : !!on });
+    }
+    listen("edge-hide-updated", applyEdgeHide);
+    applyEdgeHide();
+
     // ---- 交互：拖动（data-tauri-drag-region）、双击开 web、右键开设置 ----
     stage.addEventListener("dblclick", async () => {
       const url = await invoke("web_url");

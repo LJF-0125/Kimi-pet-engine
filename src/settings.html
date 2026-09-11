@@ -65,6 +65,13 @@
   </div>
   <p class="tip">勾选后会自动往 ~/.kimi-code/config.toml 写入 SessionStart 钩子（取消则移除），之后每次 Kimi Code 开会话都会自动拉起桌宠。</p>
   <p class="tip" id="web-restart-hint" style="display: none; color: #c05a1e">检测到 kimi web 正在运行：钩子是进程启动时加载的，需重启 kimi web 后此变更才会生效。</p>
+  <div class="row">
+    <div class="label">隐藏</div>
+    <label style="flex: 1; font-size: 13px; display: flex; align-items: center; gap: 6px; cursor: pointer">
+      <input type="checkbox" id="edge-hide" /> 拖到屏幕边缘时自动隐藏
+    </label>
+  </div>
+  <p class="tip">贴边后桌宠只留一小条在屏幕边缘，鼠标移上去即可唤回。</p>
   <p class="tip">为每种状态选一张透明底 GIF；未设置的状态会沿用「空闲中」的 GIF。</p>
   <div id="rows"></div>
 
@@ -215,6 +222,14 @@
         webRestartHint.style.display = "none";
         alert("更新配置失败：" + e);
       }
+    });
+
+    // ---- 贴边自动隐藏勾选：状态存 IndexedDB，桌宠窗口监听后同步给 Rust ----
+    const edgeHide = document.getElementById("edge-hide");
+    idbGet("edgeHide").then((on) => { edgeHide.checked = on === null ? true : !!on; });
+    edgeHide.addEventListener("change", async () => {
+      await idbPut("edgeHide", edgeHide.checked);
+      await emit("edge-hide-updated");
     });
   </script>
 </body>
