@@ -37,6 +37,32 @@
       font-size: 24px;
     }
     .preview img { max-width: 100%; max-height: 100%; }
+    /* 头框编辑器 */
+    #head-tabs button.active { border-color: #4a7ddb; font-weight: 600; }
+    #head-stage {
+      position: relative;
+      width: 220px;
+      height: 220px;
+      flex-shrink: 0;
+      border-radius: 8px;
+      background: repeating-conic-gradient(#ddd 0 25%, #fff 0 50%) 0 0 / 16px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      cursor: crosshair;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    #head-img { max-width: 100%; max-height: 100%; pointer-events: none; }
+    #head-box {
+      position: absolute;
+      display: none;
+      border: 2px solid #e0453a;
+      background: rgba(224, 69, 58, 0.15);
+      pointer-events: none;
+      box-sizing: border-box;
+    }
     .actions { margin-left: auto; display: flex; gap: 8px; }
     button {
       border: 1px solid #d0d3d9;
@@ -67,11 +93,30 @@
   <p class="tip" id="web-restart-hint" style="display: none; color: #c05a1e">检测到 kimi web 正在运行：钩子是进程启动时加载的，需重启 kimi web 后此变更才会生效。</p>
   <div class="row">
     <div class="label">隐藏</div>
-    <label style="flex: 1; font-size: 13px; display: flex; align-items: center; gap: 6px; cursor: pointer">
-      <input type="checkbox" id="edge-hide" /> 拖到屏幕边缘时自动隐藏
-    </label>
+    <select id="hide-mode" style="flex: 1; padding: 6px; font-size: 13px">
+      <option value="off">关闭</option>
+      <option value="sliver">拖到边缘时露出一条</option>
+      <option value="head">拖到边缘时只露头</option>
+    </select>
   </div>
-  <p class="tip">贴边后桌宠只留一小条在屏幕边缘，鼠标移上去即可唤回。</p>
+  <p class="tip">露出一条：贴边后留一小条在边缘；只露头：只留角色头部，可在下方框选头部区域。鼠标移上去即可唤回。</p>
+  <div id="head-editor" style="display: none">
+    <div class="row">
+      <div class="label">头框</div>
+      <div id="head-tabs" style="flex: 1; display: flex; gap: 6px"></div>
+    </div>
+    <div class="row" style="align-items: flex-start">
+      <div id="head-stage">
+        <img id="head-img" alt="" draggable="false" />
+        <div id="head-box"></div>
+      </div>
+      <div style="display: flex; flex-direction: column; gap: 8px">
+        <button id="head-detect">自动检测</button>
+        <button id="head-clear">清除</button>
+      </div>
+    </div>
+    <p class="tip">在图上拖出一个框圈住角色头部；拖到屏幕边缘隐藏时将只露出这个区域。换 GIF 后需要重新框选。</p>
+  </div>
   <p class="tip">为每种状态选一张透明底 GIF；未设置的状态会沿用「空闲中」的 GIF。</p>
   <div id="rows"></div>
 
@@ -146,16 +191,20 @@
         const file = input.files[0];
         if (!file) return;
         await idbPut(key, file);
+        await idbDel("headRect:" + key); // 头框跟着图走，换图后需重框
         showPreview(key, file);
         await emit("gifs-updated");
+        await emit("head-rect-updated");
         input.value = "";
       });
 
       row.querySelector('[data-act="pick"]').addEventListener("click", () => input.click());
       row.querySelector('[data-act="clear"]').addEventListener("click", async () => {
         await idbDel(key);
+        await idbDel("headRect:" + key);
         showPreview(key, null);
         await emit("gifs-updated");
+        await emit("head-rect-updated");
       });
 
       row.appendChild(input);
@@ -224,13 +273,194 @@
       }
     });
 
-    // ---- 贴边自动隐藏勾选：状态存 IndexedDB，桌宠窗口监听后同步给 Rust ----
-    const edgeHide = document.getElementById("edge-hide");
-    idbGet("edgeHide").then((on) => { edgeHide.checked = on === null ? true : !!on; });
-    edgeHide.addEventListener("change", async () => {
-      await idbPut("edgeHide", edgeHide.checked);
+    // ---- 贴边自动隐藏：模式存 IndexedDB（键 hideMode），桌宠窗口监听后同步给 Rust ----
+    const hideMode = document.getElementById("hide-mode");
+    const headEditor = document.getElementById("head-editor");
+    idbGet("hideMode").then(async (m) => {
+      if (m === null) m = (await idbGet("edgeHide")) === false ? "off" : "sliver"; // 旧键迁移
+      hideMode.value = m;
+      headEditor.style.display = m === "head" ? "block" : "none";
+    });
+    hideMode.addEventListener("change", async () => {
+      await idbPut("hideMode", hideMode.value);
+      headEditor.style.display = hideMode.value === "head" ? "block" : "none";
       await emit("edge-hide-updated");
     });
+
+    // ---- 头框编辑器：框存 IndexedDB（键 headRect:<state>，图片相对 0~1 坐标）----
+    const headTabs = document.getElementById("head-tabs");
+    const headStage = document.getElementById("head-stage");
+    const headImg = document.getElementById("head-img");
+    const headBox = document.getElementById("head-box");
+    let headState = "idle";
+    let headImgUrl = null;
+
+    for (const [key, label] of STATES) {
+      const b = document.createElement("button");
+      b.textContent = label;
+      b.dataset.state = key;
+      b.addEventListener("click", () => showHeadState(key));
+      headTabs.appendChild(b);
+    }
+
+    function headImgLoaded() {
+      if (headImg.complete && headImg.naturalWidth) return Promise.resolve();
+      return new Promise((res) => headImg.addEventListener("load", res, { once: true }));
+    }
+
+    async function showHeadState(key) {
+      headState = key;
+      for (const b of headTabs.children) b.classList.toggle("active", b.dataset.state === key);
+      headBox.style.display = "none";
+      if (headImgUrl) {
+        URL.revokeObjectURL(headImgUrl);
+        headImgUrl = null;
+      }
+      let blob = await idbGet(key);
+      if (!blob) {
+        try {
+          const resp = await fetch(`default-gifs/${key}.gif`);
+          if (resp.ok) blob = await resp.blob();
+        } catch (_) {}
+      }
+      if (!blob) {
+        headImg.style.display = "none";
+        return;
+      }
+      headImg.style.display = "";
+      headImgUrl = URL.createObjectURL(blob);
+      headImg.src = headImgUrl;
+      await headImgLoaded();
+      let rect = await idbGet("headRect:" + key);
+      if (!rect) {
+        rect = await detectHead(); // 无存框时自动检测给初始框
+        if (rect) {
+          await idbPut("headRect:" + key, rect);
+          await emit("head-rect-updated");
+        }
+      }
+      if (rect) paintHeadBox(rect);
+    }
+
+    // 把图片相对坐标的框画到覆盖层（经图片元素的渲染盒换算）
+    function paintHeadBox(rect) {
+      const ib = headImg.getBoundingClientRect();
+      const sb = headStage.getBoundingClientRect();
+      headBox.style.left = ib.left - sb.left + rect.x * ib.width + "px";
+      headBox.style.top = ib.top - sb.top + rect.y * ib.height + "px";
+      headBox.style.width = rect.w * ib.width + "px";
+      headBox.style.height = rect.h * ib.height + "px";
+      headBox.style.display = "block";
+    }
+
+    // 橡皮筋画框：以图片元素为坐标基准，归一化后保存
+    let drawing = null;
+    function rubberRect(x1, y1) {
+      const ib = headImg.getBoundingClientRect();
+      const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+      const ax = clamp(drawing.x0, ib.left, ib.right);
+      const ay = clamp(drawing.y0, ib.top, ib.bottom);
+      const bx = clamp(x1, ib.left, ib.right);
+      const by = clamp(y1, ib.top, ib.bottom);
+      const w = Math.abs(bx - ax);
+      const h = Math.abs(by - ay);
+      if (w < 4 || h < 4) return null;
+      return {
+        x: (Math.min(ax, bx) - ib.left) / ib.width,
+        y: (Math.min(ay, by) - ib.top) / ib.height,
+        w: w / ib.width,
+        h: h / ib.height,
+      };
+    }
+    headStage.addEventListener("mousedown", (e) => {
+      if (!headImg.naturalWidth) return;
+      e.preventDefault();
+      drawing = { x0: e.clientX, y0: e.clientY };
+    });
+    window.addEventListener("mousemove", (e) => {
+      if (!drawing) return;
+      const rect = rubberRect(e.clientX, e.clientY);
+      if (rect) paintHeadBox(rect);
+    });
+    window.addEventListener("mouseup", async (e) => {
+      if (!drawing) return;
+      const rect = rubberRect(e.clientX, e.clientY);
+      drawing = null;
+      if (!rect) {
+        const saved = await idbGet("headRect:" + headState); // 框太小：还原已存框
+        if (saved) paintHeadBox(saved);
+        else headBox.style.display = "none";
+        return;
+      }
+      await idbPut("headRect:" + headState, rect);
+      paintHeadBox(rect);
+      await emit("head-rect-updated");
+    });
+
+    // 自动检测：扫 GIF 首帧 alpha，头部取角色最上沿往下 58% 高度内不透明像素的横向范围
+    // （按 Q 版大头比例定的种子值，不准时用户手动画框覆盖）
+    async function detectHead() {
+      await headImgLoaded();
+      const nw = headImg.naturalWidth;
+      const nh = headImg.naturalHeight;
+      const cv = document.createElement("canvas");
+      cv.width = nw;
+      cv.height = nh;
+      const ctx = cv.getContext("2d");
+      ctx.drawImage(headImg, 0, 0);
+      const data = ctx.getImageData(0, 0, nw, nh).data;
+      let top = -1;
+      let bottom = -1;
+      for (let y = 0; y < nh; y++) {
+        for (let x = 0; x < nw; x++) {
+          if (data[(y * nw + x) * 4 + 3] > 16) {
+            if (top < 0) top = y;
+            bottom = y;
+          }
+        }
+      }
+      if (top < 0) return null;
+      const hh = 0.58 * (bottom - top);
+      let hx0 = nw;
+      let hx1 = 0;
+      let found = false;
+      for (let y = top; y <= Math.floor(top + hh); y++) {
+        for (let x = 0; x < nw; x++) {
+          if (data[(y * nw + x) * 4 + 3] > 16) {
+            if (x < hx0) hx0 = x;
+            if (x > hx1) hx1 = x;
+            found = true;
+          }
+        }
+      }
+      if (!found) return null;
+      const clamp01 = (v) => Math.max(0, Math.min(1, v));
+      const x = clamp01(hx0 / nw - 0.02);
+      const y = clamp01(top / nh - 0.02);
+      return {
+        x,
+        y,
+        w: Math.min(1 - x, (hx1 - hx0) / nw + 0.04),
+        h: Math.min(1 - y, hh / nh + 0.04),
+      };
+    }
+
+    document.getElementById("head-detect").addEventListener("click", async () => {
+      const rect = await detectHead();
+      if (!rect) {
+        alert("未检测到角色（需要透明底 GIF）");
+        return;
+      }
+      await idbPut("headRect:" + headState, rect);
+      paintHeadBox(rect);
+      await emit("head-rect-updated");
+    });
+    document.getElementById("head-clear").addEventListener("click", async () => {
+      await idbDel("headRect:" + headState);
+      headBox.style.display = "none";
+      await emit("head-rect-updated");
+    });
+    showHeadState("idle");
   </script>
 </body>
 </html>

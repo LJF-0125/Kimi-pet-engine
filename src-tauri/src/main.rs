@@ -73,8 +73,10 @@ fn main() {
             set_scale,
             launch_hook::get_launch_hook,
             launch_hook::set_launch_hook,
-            edge_hide::get_edge_hide,
-            edge_hide::set_edge_hide
+            edge_hide::set_hide_mode,
+            edge_hide::set_head_rect,
+            edge_hide::reveal_if_hidden,
+            edge_hide::try_rehide
         ])
         .setup(|app| {
             // 系统托盘：左键单击 → 设置；右键菜单 → 桌宠设置 / 退出

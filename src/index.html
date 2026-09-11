@@ -25,6 +25,7 @@
       max-width: 100%;
       max-height: 100%;
       pointer-events: none; /* 鼠标事件由 stage 统一处理 */
+      transition: transform 0.18s ease; /* 只露头隐藏时的旋转动画 */
     }
     #stage.offline #pet,
     #stage.offline #placeholder {
@@ -127,13 +128,64 @@
     listen("scale-updated", applyScale);
     applyScale();
 
-    // ---- 贴边自动隐藏：开关存 IndexedDB（键 edgeHide），同步给 Rust 端 ----
-    async function applyEdgeHide() {
-      const on = await idbGet("edgeHide");
-      invoke("set_edge_hide", { enabled: on === null ? true : !!on });
+    // ---- 贴边自动隐藏：模式存 IndexedDB（键 hideMode），同步给 Rust 端 ----
+    async function applyHideMode() {
+      let mode = await idbGet("hideMode");
+      if (mode === null) {
+        // 旧键 edgeHide（bool）迁移：false→关闭，其余→露出一条
+        mode = (await idbGet("edgeHide")) === false ? "off" : "sliver";
+      }
+      invoke("set_hide_mode", { mode });
     }
-    listen("edge-hide-updated", applyEdgeHide);
-    applyEdgeHide();
+    listen("edge-hide-updated", applyHideMode);
+    applyHideMode();
+    // 悬停唤回；离开后没拖走、还停在边缘 → 600ms 后自动重新隐藏
+    // （拖动中不打断由 Rust 端按 Moved 事件判断：原生拖动结束时 mouseup 不会回传页面）
+    let rehideTimer = null;
+    stage.addEventListener("mouseenter", () => {
+      clearTimeout(rehideTimer);
+      invoke("reveal_if_hidden");
+    });
+    stage.addEventListener("mouseleave", () => {
+      clearTimeout(rehideTimer);
+      rehideTimer = setTimeout(() => invoke("try_rehide"), 600);
+    });
+
+    // ---- 只露头的头框：IndexedDB 存图片相对坐标（键 headRect:<state>），
+    //      换算成窗口相对坐标后同步给 Rust（旋转由 Rust 按隐藏方向决定）----
+    async function syncHeadRect() {
+      if (!pet.complete || !pet.naturalWidth) return; // 图片未就绪，等 load 事件再触发
+      // 头框跟着实际显示的图走：当前状态无图时显示的是 idle
+      const displayed = urls[currentState] ? currentState : "idle";
+      const rect = await idbGet("headRect:" + displayed);
+      if (!rect) {
+        invoke("set_head_rect", { rect: null });
+        return;
+      }
+      const ib = pet.getBoundingClientRect();
+      const sb = stage.getBoundingClientRect();
+      if (!ib.width || !sb.width) return;
+      invoke("set_head_rect", {
+        rect: {
+          x: (ib.left - sb.left + rect.x * ib.width) / sb.width,
+          y: (ib.top - sb.top + rect.y * ib.height) / sb.height,
+          w: (rect.w * ib.width) / sb.width,
+          h: (rect.h * ib.height) / sb.height,
+        },
+      });
+    }
+    pet.addEventListener("load", syncHeadRect);
+    listen("head-rect-updated", syncHeadRect);
+
+    // Rust 在隐藏/滑回动画起点发的事件：只露头时旋转画面，让身体朝向屏幕外被边框
+    // 挡住（左 90° / 右 270° / 顶 180°）；滑回时转正
+    listen("edge-hide", (e) => {
+      if (e.payload.hidden) {
+        pet.style.transform = e.payload.rotate ? `rotate(${e.payload.rotate}deg)` : "";
+      } else {
+        pet.style.transform = "";
+      }
+    });
 
     // ---- 交互：拖动（data-tauri-drag-region）、双击开 web、右键开设置 ----
     stage.addEventListener("dblclick", async () => {
