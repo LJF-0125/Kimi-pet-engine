@@ -92,6 +92,13 @@
   <p class="tip">勾选后会自动往 ~/.kimi-code/config.toml 写入 SessionStart 钩子（取消则移除），之后每次 Kimi Code 开会话都会自动拉起桌宠。</p>
   <p class="tip" id="web-restart-hint" style="display: none; color: #c05a1e">检测到 kimi web 正在运行：钩子是进程启动时加载的，需重启 kimi web 后此变更才会生效。</p>
   <div class="row">
+    <div class="label">退出</div>
+    <label style="flex: 1; font-size: 13px; display: flex; align-items: center; gap: 6px; cursor: pointer">
+      <input type="checkbox" id="auto-quit" /> Kimi Code 退出后自动关闭
+    </label>
+  </div>
+  <p class="tip">勾选后：Kimi Code 服务主动关停时桌宠立即退出；服务失联（如被结束进程）持续约 2 分钟也会退出。本次运行从未连上过服务则不会退出。</p>
+  <div class="row">
     <div class="label">隐藏</div>
     <select id="hide-mode" style="flex: 1; padding: 6px; font-size: 13px">
       <option value="off">关闭</option>
@@ -281,6 +288,14 @@
         webRestartHint.style.display = "none";
         alert("更新配置失败：" + e);
       }
+    });
+
+    // ---- 自动关闭勾选：存 IndexedDB（键 autoQuit），桌宠窗口监听后推送给 Rust ----
+    const autoQuit = document.getElementById("auto-quit");
+    idbGet("autoQuit").then((v) => { autoQuit.checked = !!v; });
+    autoQuit.addEventListener("change", async () => {
+      await idbPut("autoQuit", autoQuit.checked);
+      await emit("auto-quit-updated");
     });
 
     // ---- 贴边自动隐藏：模式存 IndexedDB（键 hideMode），桌宠窗口监听后同步给 Rust ----

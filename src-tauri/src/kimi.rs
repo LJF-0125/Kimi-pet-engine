@@ -8,10 +8,15 @@
 //! - `offline`   kimi web 服务不在线
 //!
 //! 多会话并发时按会话聚合：任一待审核 > 任一编辑中 > 任一思考中 > 全空闲。
+//!
+//! 「Kimi Code 退出后自动关闭」（设置项，默认关）：本次运行连上过服务后，
+//! 持续失联超过 AUTO_QUIT_AFTER 视为 Kimi Code 已退出，自动结束进程；
+//! 收到服务端优雅关停的关闭帧（reason 为 'server shutting down'）则立即退出。
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::fs;
 use std::time::{Duration, Instant};
@@ -26,6 +31,8 @@ const MAX_PORT_TRIES: u16 = 100; // 官方文档：端口占用时服务至多�
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 // 断线宽限：10 秒内保持原状态不灰化，超过仍未恢复才置为 offline
 const OFFLINE_GRACE: Duration = Duration::from_secs(10);
+// 自动关闭：连上过服务后持续失联超过该时长视为 Kimi Code 已退出（2 分钟，容忍服务短暂重启）
+const AUTO_QUIT_AFTER: Duration = Duration::from_secs(120);
 // REST 轮询间隔：用 busy / pending_interaction 校准 WS 事件推断出的状态
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 
@@ -68,6 +75,21 @@ fn state_cell() -> &'static Mutex<&'static str> {
 /// 前端 `get_state` command 用：读取当前状态。
 pub fn current_state() -> &'static str {
     *state_cell().lock().unwrap()
+}
+
+/// 「Kimi Code 退出后自动关闭」开关：勾选状态存前端 IndexedDB，启动/变更时由主窗口推送。
+static AUTO_QUIT: AtomicBool = AtomicBool::new(false);
+/// 本次运行是否连上过服务：没连上过不自动退出（用户可能只是单独开着桌宠，服务稍后才会起）。
+static CONNECTED_ONCE: AtomicBool = AtomicBool::new(false);
+
+#[tauri::command]
+pub fn set_auto_quit(enabled: bool) {
+    AUTO_QUIT.store(enabled, Ordering::Relaxed);
+}
+
+/// 自动关闭是否生效：开关打开且本次运行连上过服务。
+fn auto_quit_armed() -> bool {
+    AUTO_QUIT.load(Ordering::Relaxed) && CONNECTED_ONCE.load(Ordering::Relaxed)
 }
 
 fn set_state(app: &AppHandle, state: PetState) {
@@ -258,10 +280,15 @@ fn aggregate(sessions: &HashMap<String, SessionState>) -> PetState {
 }
 
 /// 记录断线时刻：宽限期内保持原状态，超过 OFFLINE_GRACE 仍未恢复才置为离线。
+/// 自动关闭生效时，持续失联超过 AUTO_QUIT_AFTER 视为 Kimi Code 已退出，结束进程。
 fn mark_disconnected(app: &AppHandle, since: &mut Option<Instant>) {
     let start = since.get_or_insert_with(Instant::now);
     if start.elapsed() >= OFFLINE_GRACE {
         set_state(app, PetState::Offline);
+    }
+    if auto_quit_armed() && start.elapsed() >= AUTO_QUIT_AFTER {
+        eprintln!("[kimi-pet] 服务持续失联超过 {AUTO_QUIT_AFTER:?}，按「自动关闭」设置退出");
+        app.exit(0);
     }
 }
 
@@ -314,6 +341,7 @@ pub async fn run(app: AppHandle) {
         };
         eprintln!("[kimi-pet] 已连接 kimi web（端口 {port}）");
         disconnected_since = None;
+        CONNECTED_ONCE.store(true, Ordering::Relaxed);
 
         // 订阅当前所有会话的事件
         let client = reqwest::Client::new();
@@ -342,6 +370,15 @@ pub async fn run(app: AppHandle) {
                 msg = ws_read.next() => {
                     let text = match msg {
                         Some(Ok(Message::Text(t))) => t,
+                        // 服务器优雅关停会给所有连接发 reason 为 'server shutting down' 的关闭帧：
+                        // 语义明确（区别于心跳超时踢线），自动关闭生效时立即退出
+                        Some(Ok(Message::Close(Some(frame))))
+                            if frame.reason.as_str() == "server shutting down" && auto_quit_armed() =>
+                        {
+                            eprintln!("[kimi-pet] 收到服务关停信号，按「自动关闭」设置退出");
+                            app.exit(0);
+                            break;
+                        }
                         // None / Close / Err 都视为连接断开
                         None | Some(Ok(Message::Close(_))) | Some(Err(_)) => break,
                         Some(Ok(_)) => continue,
