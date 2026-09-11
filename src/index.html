@@ -20,6 +20,8 @@
       align-items: center;
       justify-content: center;
       cursor: grab;
+      box-sizing: border-box;
+      transition: padding-top 0.18s ease; /* 弹跳前平滑腾出头顶空间 */
     }
     #pet {
       max-width: 100%;
@@ -36,6 +38,19 @@
       font-size: 64px;
       text-align: center;
       pointer-events: none;
+    }
+    /* 待审核提醒：跳两下歇一会儿的循环（挂在 stage 上，和 #pet 的旋转互不干扰） */
+    @keyframes approval-hop {
+      0%, 100% { transform: translateY(0); }
+      8% { transform: translateY(-14px); }
+      16% { transform: translateY(0); }
+      24% { transform: translateY(-8px); }
+      32% { transform: translateY(0); }
+    }
+    /* 弹跳时加 26px 头顶内边距：竖版 GIF 高度撑满窗口，没空间跳会被窗口上沿裁掉 */
+    #stage.alert-hop {
+      animation: approval-hop 1.8s ease-in-out infinite;
+      padding-top: 26px;
     }
   </style>
 </head>
@@ -115,6 +130,63 @@
         currentState = STATES.includes(state) ? state : "idle";
       }
       render();
+      // 待审核提醒：按进入/离开的边沿触发
+      const approval = state === "approval";
+      if (approval !== wasApproval) {
+        wasApproval = approval;
+        if (approval) onApprovalStart();
+        else onApprovalEnd();
+      }
+    }
+
+    // ---- 待审核主动提醒：弹跳 + 探出隐藏 + 可选提示音；开关存 IndexedDB ----
+    let wasApproval = false;
+    let alertOn = true;
+    let alertSound = false;
+
+    async function applyAlertPrefs() {
+      const a = await idbGet("alertApproval");
+      const s = await idbGet("alertSound");
+      alertOn = a === null ? true : !!a; // 默认开
+      alertSound = s === null ? false : !!s; // 默认关
+      if (!alertOn) stage.classList.remove("alert-hop");
+    }
+    listen("alert-updated", applyAlertPrefs);
+    applyAlertPrefs();
+
+    function onApprovalStart() {
+      if (!alertOn) return;
+      stage.classList.add("alert-hop");
+      invoke("reveal_if_hidden"); // 藏着就探出来，没藏是空操作
+      if (alertSound) chime();
+      setTimeout(syncHeadRect, 200); // 内边距改变了图片位置，头框映射重算
+    }
+
+    function onApprovalEnd() {
+      stage.classList.remove("alert-hop");
+      setTimeout(syncHeadRect, 200);
+      // 处理完后：鼠标不在宠物身上且没拖走（还停在边缘）→ 自动收回
+      setTimeout(() => {
+        if (!stage.matches(":hover")) invoke("try_rehide");
+      }, 1500);
+    }
+
+    // 提示音：WebAudio 振荡器合成两声短嘀，不依赖音频文件
+    let audioCtx = null;
+    function chime() {
+      try {
+        audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+        for (const t of [0, 0.2]) {
+          const osc = audioCtx.createOscillator();
+          const gain = audioCtx.createGain();
+          osc.frequency.value = 880;
+          gain.gain.setValueAtTime(0.08, audioCtx.currentTime + t);
+          gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + t + 0.15);
+          osc.connect(gain).connect(audioCtx.destination);
+          osc.start(audioCtx.currentTime + t);
+          osc.stop(audioCtx.currentTime + t + 0.16);
+        }
+      } catch (_) {}
     }
 
     // 设置窗口保存后刷新

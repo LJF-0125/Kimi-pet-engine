@@ -117,6 +117,16 @@
     </div>
     <p class="tip">在图上拖出一个框圈住角色头部；拖到屏幕边缘隐藏时将只露出这个区域。换 GIF 后需要重新框选。</p>
   </div>
+  <div class="row">
+    <div class="label">提醒</div>
+    <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer">
+      <input type="checkbox" id="alert-approval" /> 审批时探出并弹跳
+    </label>
+    <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer">
+      <input type="checkbox" id="alert-sound" /> 提示音
+    </label>
+  </div>
+  <p class="tip">有待处理的审批/提问时：宠物弹跳提醒，藏在边缘会自动探出；处理完后若没动过会自动收回。提示音为两声短嘀，随提醒开关生效。</p>
   <p class="tip">为每种状态选一张透明底 GIF；未设置的状态会沿用「空闲中」的 GIF。</p>
   <div id="rows"></div>
 
@@ -461,6 +471,18 @@
       await emit("head-rect-updated");
     });
     showHeadState("idle");
+
+    // ---- 审批提醒开关：存 IndexedDB，桌宠窗口监听 alert-updated ----
+    const alertApproval = document.getElementById("alert-approval");
+    const alertSound = document.getElementById("alert-sound");
+    idbGet("alertApproval").then((v) => { alertApproval.checked = v === null ? true : !!v; });
+    idbGet("alertSound").then((v) => { alertSound.checked = v === null ? false : !!v; });
+    for (const [el, key] of [[alertApproval, "alertApproval"], [alertSound, "alertSound"]]) {
+      el.addEventListener("change", async () => {
+        await idbPut(key, el.checked);
+        await emit("alert-updated");
+      });
+    }
   </script>
 </body>
 </html>

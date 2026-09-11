@@ -15,8 +15,9 @@ use tauri::{Emitter, Manager, PhysicalPosition, WebviewWindow, WindowEvent};
 const SNAP_GAP: i32 = 8;
 /// sliver 模式隐藏后留在屏幕内的比例：露出窗口宽/高的 1/4
 const SLIVER_DIV: i32 = 4;
-/// head 模式头部埋进屏幕边缘的比例（0.15 = 头部 85% 露出）
-const BURY: f64 = 0.15;
+/// head 模式头框埋进屏幕边缘的比例（0 = 框选区域完全露出，框边与屏幕边框平齐，
+/// 用户框多少就露多少；想更"嵌进"边缘可调到 0.1~0.2）
+const BURY: f64 = 0.0;
 /// 拖动结束后的防抖延迟：松手超过这个时间没有再移动才触发隐藏
 const SETTLE_MS: u64 = 350;
 
@@ -212,7 +213,7 @@ fn hide_target(window: &WebviewWindow) -> Option<(Edge, PhysicalPosition<i32>, i
     let clamp = |v: i32, lo: i32, hi: i32| v.max(lo).min(hi.max(lo));
 
     // head 模式且有头框：画面绕窗口中心旋转，让身体朝向屏幕外（左 90°CW / 右 90°CCW /
-    // 顶 180°），身体被边框挡住；再按旋转后的头框贴边（85% 露出）
+    // 顶 180°），身体被边框挡住；再按旋转后的头框贴边（框选区域完全露出，见 BURY）
     if *MODE.lock().unwrap() == HideMode::Head {
         if let Some(r) = *HEAD_RECT.lock().unwrap() {
             // 把头框映射到旋转后的窗口坐标（窗口是正方形，绕中心转 90/180 仍落在窗口内）
