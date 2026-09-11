@@ -119,6 +119,14 @@
     // 设置窗口保存后刷新
     listen("gifs-updated", loadGifs);
 
+    // ---- 大小缩放：比例存 IndexedDB（键 scale），由 Rust 端调整窗口实际尺寸 ----
+    async function applyScale() {
+      const scale = (await idbGet("scale")) || 1;
+      invoke("set_scale", { scale });
+    }
+    listen("scale-updated", applyScale);
+    applyScale();
+
     // ---- 交互：拖动（data-tauri-drag-region）、双击开 web、右键开设置 ----
     stage.addEventListener("dblclick", async () => {
       const url = await invoke("web_url");
