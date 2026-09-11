@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod kimi;
+mod launch_hook;
 
 use tauri::Manager;
 
@@ -30,7 +31,7 @@ fn show_settings(app: &tauri::AppHandle) {
         tauri::WebviewUrl::App("settings.html".into()),
     )
     .title("桌宠设置")
-    .inner_size(520.0, 540.0)
+    .inner_size(520.0, 590.0)
     .resizable(true)
     .build();
 }
@@ -61,8 +62,17 @@ fn spawn_show_settings(app: &tauri::AppHandle) {
 
 fn main() {
     tauri::Builder::default()
+        // 单实例：hook / 手动重复启动时只保留先运行的实例
+        .plugin(tauri_plugin_single_instance::init(|_app, _args, _cwd| {}))
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![web_url, get_state, open_settings, set_scale])
+        .invoke_handler(tauri::generate_handler![
+            web_url,
+            get_state,
+            open_settings,
+            set_scale,
+            launch_hook::get_launch_hook,
+            launch_hook::set_launch_hook
+        ])
         .setup(|app| {
             // 系统托盘：左键单击 → 设置；右键菜单 → 桌宠设置 / 退出
             let settings = tauri::menu::MenuItem::with_id(app, "settings", "桌宠设置", true, None::<&str>)?;
