@@ -56,9 +56,32 @@ pub fn get_launch_hook() -> bool {
     hook_exists(&doc)
 }
 
+/// 检测是否有 kimi web 服务正在运行（实例清单里的心跳在 2 分钟内）。
+/// hooks 只在 kimi 进程启动时加载一次，已在运行的服务感知不到刚写入的 hook。
+fn web_server_alive() -> bool {
+    let Some(dir) = dirs::home_dir().map(|h| h.join(".kimi-code").join("server").join("instances")) else {
+        return false;
+    };
+    let Ok(entries) = fs::read_dir(dir) else { return false };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    for entry in entries.flatten() {
+        let Ok(text) = fs::read_to_string(entry.path()) else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+        let Some(hb) = v.get("heartbeat_at").and_then(|h| h.as_i64()) else { continue };
+        if now - hb < 120_000 {
+            return true;
+        }
+    }
+    false
+}
+
 /// 勾选 / 取消勾选：写入或移除 hook 条目。失败时返回错误信息给前端提示。
+/// 返回值表示是否有 kimi web 在运行（在跑的服务需重启后变更才生效）。
 #[tauri::command]
-pub fn set_launch_hook(enabled: bool) -> Result<(), String> {
+pub fn set_launch_hook(enabled: bool) -> Result<bool, String> {
     let path = config_path().ok_or("找不到用户目录")?;
     let text = fs::read_to_string(&path).unwrap_or_default();
     let mut doc = if text.trim().is_empty() {
@@ -102,5 +125,5 @@ pub fn set_launch_hook(enabled: bool) -> Result<(), String> {
         fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败：{e}"))?;
     }
     fs::write(&path, doc.to_string()).map_err(|e| format!("写入 config.toml 失败：{e}"))?;
-    Ok(())
+    Ok(web_server_alive())
 }
