@@ -31,8 +31,12 @@ const MAX_PORT_TRIES: u16 = 100; // 官方文档：端口占用时服务至多�
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 // 断线宽限：10 秒内保持原状态不灰化，超过仍未恢复才置为 offline
 const OFFLINE_GRACE: Duration = Duration::from_secs(10);
-// 自动关闭：连上过服务后持续失联超过该时长视为 Kimi Code 已退出（2 分钟，容忍服务短暂重启）
-const AUTO_QUIT_AFTER: Duration = Duration::from_secs(120);
+// 自动关闭：连上过服务后持续失联超过该时长视为 Kimi Code 已退出（30 秒，容忍服务短暂重启）
+const AUTO_QUIT_AFTER: Duration = Duration::from_secs(30);
+// REST 轮询连续失败该次数后判定连接已死，断开重连。
+// 用于识别 kimi web 优雅关停卡死：进程/端口还在但不再响应，WS 层永远收不到关闭帧
+const REST_FAIL_BREAK: u32 = 3;
+
 // REST 轮询间隔：用 busy / pending_interaction 校准 WS 事件推断出的状态
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 
@@ -84,6 +88,7 @@ static CONNECTED_ONCE: AtomicBool = AtomicBool::new(false);
 
 #[tauri::command]
 pub fn set_auto_quit(enabled: bool) {
+    eprintln!("[kimi-pet] 自动关闭开关推送：{enabled}");
     AUTO_QUIT.store(enabled, Ordering::Relaxed);
 }
 
@@ -142,23 +147,32 @@ async fn healthz_ok(client: &reqwest::Client, port: u16) -> bool {
     matches!(client.get(&url).send().await, Ok(resp) if resp.status().is_success())
 }
 
-/// 发现本地 kimi web 服务：先按实例清单（服务自报端口）探测，再从默认端口起扫描。
+/// 发现本地 kimi web 服务：实例清单（服务自报端口）与默认端口段一起探测。
+/// 必须并发：本机连已关闭的端口可能要 1~2 秒才被拒绝（WFP/安全软件过滤层），
+/// 顺序扫 100 个端口需一分多钟，会把自动关闭的失联计时卡死在扫描里。
 async fn find_port() -> Option<u16> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(800))
         .build()
         .ok()?;
-    for port in instance_ports() {
-        if healthz_ok(&client, port).await {
-            return Some(port);
-        }
-    }
-    for port in BASE_PORT..BASE_PORT + MAX_PORT_TRIES {
-        if healthz_ok(&client, port).await {
-            return Some(port);
-        }
-    }
-    None
+    let preferred = instance_ports();
+    let mut candidates = preferred.clone();
+    candidates.extend(BASE_PORT..BASE_PORT + MAX_PORT_TRIES);
+    candidates.sort_unstable();
+    candidates.dedup();
+    let hits: Vec<u16> = futures_util::future::join_all(candidates.into_iter().map(|port| {
+        let client = client.clone();
+        async move { healthz_ok(&client, port).await.then_some(port) }
+    }))
+    .await
+    .into_iter()
+    .flatten()
+    .collect();
+    // 实例清单自报的端口优先于扫描命中
+    preferred
+        .into_iter()
+        .find(|p| hits.contains(p))
+        .or_else(|| hits.into_iter().min())
 }
 
 /// 拼出 web UI 地址，供双击打开。
@@ -172,6 +186,7 @@ pub async fn web_url() -> Option<String> {
 async fn list_session_ids(client: &reqwest::Client, port: u16, token: &str) -> Vec<String> {
     fetch_sessions(client, port, token)
         .await
+        .unwrap_or_default()
         .into_iter()
         .map(|s| s.id)
         .collect()
@@ -207,35 +222,34 @@ struct SessionInfo {
 }
 
 /// 拉取会话列表（含忙态/待处理交互），用于订阅和状态校准。
-async fn fetch_sessions(client: &reqwest::Client, port: u16, token: &str) -> Vec<SessionInfo> {
+/// 返回 None 表示请求失败（服务无响应/挂死），与"没有会话"区分开。
+async fn fetch_sessions(client: &reqwest::Client, port: u16, token: &str) -> Option<Vec<SessionInfo>> {
     let mut out = Vec::new();
     let url = format!("http://127.0.0.1:{port}/api/v1/sessions?page_size=100");
-    if let Ok(resp) = client.get(&url).bearer_auth(token).send().await {
-        if let Ok(envelope) = resp.json::<Value>().await {
-            let data = envelope.get("data").cloned().unwrap_or(Value::Null);
-            let items = data
-                .get("items")
-                .and_then(|v| v.as_array())
-                .or_else(|| data.as_array());
-            if let Some(items) = items {
-                for it in items {
-                    let Some(id) = it.get("id").and_then(|v| v.as_str()) else {
-                        continue;
-                    };
-                    out.push(SessionInfo {
-                        id: id.to_string(),
-                        busy: it.get("busy").and_then(|v| v.as_bool()).unwrap_or(false),
-                        pending: it
-                            .get("pending_interaction")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("none")
-                            .to_string(),
-                    });
-                }
-            }
+    let resp = client.get(&url).bearer_auth(token).send().await.ok()?;
+    let envelope = resp.json::<Value>().await.ok()?;
+    let data = envelope.get("data").cloned().unwrap_or(Value::Null);
+    let items = data
+        .get("items")
+        .and_then(|v| v.as_array())
+        .or_else(|| data.as_array());
+    if let Some(items) = items {
+        for it in items {
+            let Some(id) = it.get("id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            out.push(SessionInfo {
+                id: id.to_string(),
+                busy: it.get("busy").and_then(|v| v.as_bool()).unwrap_or(false),
+                pending: it
+                    .get("pending_interaction")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("none")
+                    .to_string(),
+            });
         }
     }
-    out
+    Some(out)
 }
 
 /// 用 REST 权威状态校准忙态表：待处理交互 > 忙碌 > 空闲。返回状态是否有变化。
@@ -286,6 +300,7 @@ fn mark_disconnected(app: &AppHandle, since: &mut Option<Instant>) {
     if start.elapsed() >= OFFLINE_GRACE {
         set_state(app, PetState::Offline);
     }
+    eprintln!("[kimi-pet] 失联 {:.0}s（armed={}）", start.elapsed().as_secs_f64(), auto_quit_armed());
     if auto_quit_armed() && start.elapsed() >= AUTO_QUIT_AFTER {
         eprintln!("[kimi-pet] 服务持续失联超过 {AUTO_QUIT_AFTER:?}，按「自动关闭」设置退出");
         app.exit(0);
@@ -343,8 +358,12 @@ pub async fn run(app: AppHandle) {
         disconnected_since = None;
         CONNECTED_ONCE.store(true, Ordering::Relaxed);
 
-        // 订阅当前所有会话的事件
-        let client = reqwest::Client::new();
+        // 订阅当前所有会话的事件；客户端必须带超时：服务挂死时连接不拒绝但也不响应，
+        // 无超时的请求会把 select 的轮询臂卡死，断线永远检测不到
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         let ids = list_session_ids(&client, port, &token).await;
         let (mut ws_write, mut ws_read) = ws.split();
         if ids.is_empty() {
@@ -364,6 +383,7 @@ pub async fn run(app: AppHandle) {
         let mut sessions: HashMap<String, SessionState> = HashMap::new();
         set_state(&app, PetState::Idle);
         let mut poll = tokio::time::interval(POLL_INTERVAL);
+        let mut rest_failures: u32 = 0;
 
         loop {
             tokio::select! {
@@ -460,24 +480,38 @@ pub async fn run(app: AppHandle) {
                 }
                 _ = poll.tick() => {
                     // REST 轮询校准：兜底漏事件/卡状态；顺带补订阅新会话
-                    let infos = fetch_sessions(&client, port, &token).await;
-                    if reconcile(&mut sessions, &infos) {
-                        set_state(&app, aggregate(&sessions));
-                    }
-                    let new_ids: Vec<String> = infos
-                        .iter()
-                        .map(|i| i.id.clone())
-                        .filter(|id| !subscribed.contains(id))
-                        .collect();
-                    if !new_ids.is_empty() {
-                        let frame = json!({
-                            "type": "subscribe",
-                            "payload": { "session_ids": new_ids }
-                        });
-                        if let Err(e) = ws_write.send(Message::text(frame.to_string())).await {
-                            eprintln!("[kimi-pet] 补订阅失败：{e}");
-                        } else {
-                            subscribed.extend(new_ids);
+                    match fetch_sessions(&client, port, &token).await {
+                        Some(infos) => {
+                            rest_failures = 0;
+                            if reconcile(&mut sessions, &infos) {
+                                set_state(&app, aggregate(&sessions));
+                            }
+                            let new_ids: Vec<String> = infos
+                                .iter()
+                                .map(|i| i.id.clone())
+                                .filter(|id| !subscribed.contains(id))
+                                .collect();
+                            if !new_ids.is_empty() {
+                                let frame = json!({
+                                    "type": "subscribe",
+                                    "payload": { "session_ids": new_ids }
+                                });
+                                if let Err(e) = ws_write.send(Message::text(frame.to_string())).await {
+                                    eprintln!("[kimi-pet] 补订阅失败：{e}");
+                                } else {
+                                    subscribed.extend(new_ids);
+                                }
+                            }
+                        }
+                        // 连续失败 = 服务假死（kimi web 优雅关停卡死时进程还在但不再响应，
+                        // WS 层收不到任何帧），断开走重连流程，失联计时从此开始
+                        None => {
+                            rest_failures += 1;
+                            eprintln!("[kimi-pet] REST 轮询失败（{rest_failures}/{REST_FAIL_BREAK}）");
+                            if rest_failures >= REST_FAIL_BREAK {
+                                eprintln!("[kimi-pet] 服务持续无响应，判定连接已死");
+                                break;
+                            }
                         }
                     }
                 }
