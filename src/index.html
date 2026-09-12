@@ -211,6 +211,14 @@
     }
     listen("edge-hide-updated", applyHideMode);
     applyHideMode();
+
+    // ---- Kimi Code 退出后自动关闭：开关存 IndexedDB（键 autoQuit），推送给 Rust 看门狗 ----
+    async function applyAutoQuit() {
+      invoke("set_auto_quit", { enabled: !!(await idbGet("autoQuit")) });
+    }
+    listen("auto-quit-updated", applyAutoQuit);
+    applyAutoQuit();
+
     // 悬停唤回；离开后没拖走、还停在边缘 → 600ms 后自动重新隐藏
     // （拖动中不打断由 Rust 端按 Moved 事件判断：原生拖动结束时 mouseup 不会回传页面）
     let rehideTimer = null;

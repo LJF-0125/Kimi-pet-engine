@@ -88,6 +88,7 @@ fn main() {
             updater::check_update,
             launch_hook::get_launch_hook,
             launch_hook::set_launch_hook,
+            kimi::set_auto_quit,
             edge_hide::set_hide_mode,
             edge_hide::set_head_rect,
             edge_hide::reveal_if_hidden,
