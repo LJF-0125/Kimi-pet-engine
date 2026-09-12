@@ -21,9 +21,13 @@ fn get_state() -> &'static str {
 }
 
 /// 设置窗口版本页显示用（前端走自定义 command，不依赖 capabilities 里的 app 权限）。
+/// 取 tauri.conf.json 的版本（与更新器比较用的版本同源），不是 Cargo.toml 的。
 #[tauri::command]
-fn app_version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+fn app_version(app: tauri::AppHandle) -> String {
+    app.config()
+        .version
+        .clone()
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
 }
 
 /// 打开（或聚焦）设置窗口。
