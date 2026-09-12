@@ -76,6 +76,23 @@ async fn install_and_restart(app: AppHandle) {
     app.restart();
 }
 
+/// 设置窗口的「检查更新」按钮：手动触发一次检查，结果返回给前端展示；
+/// 发现新版本时仍走原生确认弹窗。
+#[tauri::command]
+pub async fn check_update(app: AppHandle) -> Result<String, String> {
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    match updater.check().await {
+        Ok(Some(update)) => {
+            let version = update.version.clone();
+            eprintln!("[kimi-pet] 手动检查发现新版本：{version}");
+            prompt_install(app, version.clone());
+            Ok(format!("update:{version}"))
+        }
+        Ok(None) => Ok("latest".to_string()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 fn show_error(app: &AppHandle, msg: &str) {
     app.dialog()
         .message(msg.to_string())

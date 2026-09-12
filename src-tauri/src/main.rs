@@ -20,6 +20,12 @@ fn get_state() -> &'static str {
     kimi::current_state()
 }
 
+/// 设置窗口版本页显示用（前端走自定义 command，不依赖 capabilities 里的 app 权限）。
+#[tauri::command]
+fn app_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
 /// 打开（或聚焦）设置窗口。
 fn show_settings(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("settings") {
@@ -72,8 +78,10 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             web_url,
             get_state,
+            app_version,
             open_settings,
             set_scale,
+            updater::check_update,
             launch_hook::get_launch_hook,
             launch_hook::set_launch_hook,
             edge_hide::set_hide_mode,

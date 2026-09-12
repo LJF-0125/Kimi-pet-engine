@@ -73,10 +73,19 @@
       cursor: pointer;
     }
     button:hover { background: #f0f1f4; }
+    /* 页签 */
+    #tabs { display: flex; gap: 6px; margin-bottom: 14px; }
+    #tabs .tab { padding: 6px 16px; }
+    #tabs .tab.active { border-color: #4a7ddb; color: #4a7ddb; font-weight: 600; }
   </style>
 </head>
 <body>
   <h1>桌宠设置</h1>
+  <div id="tabs">
+    <button class="tab active" data-tab="settings">设置</button>
+    <button class="tab" data-tab="version">版本</button>
+  </div>
+  <div id="tab-settings">
   <p class="tip">拖动滑块调整桌宠大小，即时生效、自动保存。</p>
   <div class="row">
     <div class="label">大小</div>
@@ -129,6 +138,19 @@
   <p class="tip">有待处理的审批/提问时：宠物弹跳提醒，藏在边缘会自动探出；处理完后若没动过会自动收回。提示音为两声短嘀，随提醒开关生效。</p>
   <p class="tip">为每种状态选一张透明底 GIF；未设置的状态会沿用「空闲中」的 GIF。</p>
   <div id="rows"></div>
+  </div>
+  <div id="tab-version" style="display: none">
+    <div class="row">
+      <div class="label">当前版本</div>
+      <span id="ver-current" style="font-size: 13px">…</span>
+    </div>
+    <div class="row">
+      <div class="label">更新</div>
+      <button id="check-update">检查更新</button>
+      <span id="update-status" style="font-size: 13px; color: #888"></span>
+    </div>
+    <p class="tip">桌宠启动时和每 6 小时会自动检查更新；点按钮可立即检查。发现新版本会弹窗确认后自动下载安装并重启。</p>
+  </div>
 
   <script>
     const { emit } = window.__TAURI__.event;
@@ -140,6 +162,36 @@
       ["approval", "待审核"],
       ["idle", "空闲中"],
     ];
+
+    // ---- 页签切换 ----
+    for (const btn of document.querySelectorAll("#tabs .tab")) {
+      btn.addEventListener("click", () => {
+        for (const b of document.querySelectorAll("#tabs .tab")) b.classList.toggle("active", b === btn);
+        document.getElementById("tab-settings").style.display = btn.dataset.tab === "settings" ? "block" : "none";
+        document.getElementById("tab-version").style.display = btn.dataset.tab === "version" ? "block" : "none";
+      });
+    }
+
+    // ---- 版本页：版本号 + 手动检查更新 ----
+    invoke("app_version").then((v) => {
+      document.getElementById("ver-current").textContent = "v" + v;
+    });
+    const checkBtn = document.getElementById("check-update");
+    const updateStatus = document.getElementById("update-status");
+    checkBtn.addEventListener("click", async () => {
+      checkBtn.disabled = true;
+      updateStatus.textContent = "检查中…";
+      try {
+        const r = await invoke("check_update");
+        if (r === "latest") updateStatus.textContent = "已是最新版本";
+        else if (String(r).startsWith("update:")) updateStatus.textContent = "发现新版本 " + r.slice(7) + "，请在弹窗中确认";
+        else updateStatus.textContent = String(r);
+      } catch (e) {
+        updateStatus.textContent = "检查失败：" + e;
+      } finally {
+        checkBtn.disabled = false;
+      }
+    });
 
     // ---- IndexedDB（与桌宠窗口共享）----
     function idb() {
