@@ -70,6 +70,8 @@ gh secret set TAURI_SIGNING_PRIVATE_KEY < ~/.tauri/kimi-pet.key
 1. 推 `v*` tag → `.github/workflows/release.yml` 触发 tauri-action
 2. tauri-action 检测到 `plugins.updater` 配置且 secrets 存在 → 自动构建更新包
    （Windows 是 NSIS 安装包，macOS 是 `.app.tar.gz`）并用私钥签名
+   （前提：`tauri.conf.json` 的 `bundle.createUpdaterArtifacts` 已设为 `true`，
+   否则只出普通安装包、不生成 `.sig`/`latest.json`）
 3. 发布 release 时附带签名后的更新包和 `latest.json`（含各平台版本号、下载地址、签名）
 4. 客户端启动时及每 6 小时请求
    `https://github.com/LJF-0125/Kimi-pet-engine/releases/latest/download/latest.json`，
