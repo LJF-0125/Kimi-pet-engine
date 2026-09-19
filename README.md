@@ -44,8 +44,9 @@ GIF 来源：绝区零游戏蕾米埃尔 Q 版形象。
 
 `kimi web` 启动的本地服务暴露 REST + WebSocket API（默认 `127.0.0.1:58627`）。
 本应用自动读取 `~/.kimi-code/server.token`、探测端口、连接 `/api/v1/ws` 事件流，
-以 agent 自报的 `agent.status.updated` 阶段事件为主、REST 轮询 `busy` / `pending_interaction`
-校准为辅，聚合成四种状态推送给窗口。服务断开自动重连，断线 10 秒内保持原状态不灰化。
+以 `subscribe_v2` transcript 增量（正文/思考帧）与 agent 自报的 `agent.status.updated` 阶段事件为主、
+REST 轮询 `busy` / `pending_interaction` 校准为辅，聚合成四种状态推送给窗口
+（旧版服务不支持 `subscribe_v2` 时自动回退到纯 phase 推断）。服务断开自动重连，断线 10 秒内保持原状态不灰化。
 
 注意：该 API 是实验性的，字段可能随 Kimi Code 版本变化。
 

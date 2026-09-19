@@ -9,6 +9,9 @@
 //!
 //! 多会话并发时按会话聚合：任一待审核 > 任一编辑中 > 任一思考中 > 全空闲。
 //!
+//! 双栈订阅：v1 会话事件之外叠加 `subscribe_v2`（transcript 增量帧），
+//! 新版服务用它识别「编辑中」（旧版服务无此消息，继续靠 streaming phase）。
+//!
 //! 「Kimi Code 退出后自动关闭」（设置项，默认关）：本次运行连上过服务后，
 //! 持续失联超过 AUTO_QUIT_AFTER 视为 Kimi Code 已退出，自动结束进程；
 //! 收到服务端优雅关停的关闭帧（reason 为 'server shutting down'）则立即退出。
@@ -39,6 +42,8 @@ const REST_FAIL_BREAK: u32 = 3;
 
 // REST 轮询间隔：用 busy / pending_interaction 校准 WS 事件推断出的状态
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
+// 正文 delta 停止后的尾随时间：Answering 超过该时长未刷新才回落「思考中」（防抖）
+const ANSWER_TAIL: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PetState {
@@ -100,6 +105,7 @@ fn auto_quit_armed() -> bool {
 fn set_state(app: &AppHandle, state: PetState) {
     let mut cur = state_cell().lock().unwrap();
     if *cur != state.as_str() {
+        eprintln!("[kimi-pet] 状态：{} -> {}", *cur, state.as_str());
         *cur = state.as_str();
         let _ = app.emit("pet-state", state.as_str());
     }
@@ -196,9 +202,10 @@ async fn list_session_ids(client: &reqwest::Client, port: u16, token: &str) -> V
 /// 未知的 kind 打日志，便于发现新枚举值。
 fn map_phase(phase: &Value) -> Option<SessionState> {
     match phase.get("kind").and_then(|v| v.as_str())? {
-        // 思考中：agent 运行中、工具调用中
-        "running" | "tool_call" => Some(SessionState::Thinking),
-        // 流式输出：思考流算思考，正文流算回答
+        // 思考中：agent 运行中、工具调用中、重试中
+        "running" | "tool_call" | "retrying" => Some(SessionState::Thinking),
+        // 流式输出：思考流算思考，正文流算回答（旧版服务才有；
+        // 新版已删该枚举，「编辑中」改由 subscribe_v2 的 transcript 增量识别）
         "streaming" => {
             if phase.get("stream").and_then(|v| v.as_str()) == Some("thinking") {
                 Some(SessionState::Thinking)
@@ -206,8 +213,10 @@ fn map_phase(phase: &Value) -> Option<SessionState> {
                 Some(SessionState::Answering)
             }
         }
+        // 待审核
+        "awaiting_approval" => Some(SessionState::Approval),
         // 轮次结束 / 空闲
-        "idle" | "done" | "completed" => None,
+        "idle" | "done" | "completed" | "ended" | "interrupted" => None,
         other => {
             eprintln!("[kimi-pet] 未知 phase kind：{other}");
             None
@@ -293,6 +302,50 @@ fn aggregate(sessions: &HashMap<String, SessionState>) -> PetState {
     result
 }
 
+/// subscribe_v2 订阅帧：订阅指定会话的 transcript 增量（正文/思考帧信号），新版服务才有。
+fn sv2_frame(session_id: &str) -> Value {
+    json!({
+        "type": "subscribe_v2",
+        "id": format!("sv2-{session_id}"),
+        "payload": { "session_id": session_id, "transcript": { "*": "delta" } }
+    })
+}
+
+/// 守卫后的「置思考中」迁移（v2 transcript 增量用）：
+/// A 待审核优先——已是 Approval 的会话跳过一切非 Approval 迁移；
+/// B 编辑中新鲜期——Answering 且正文 delta 距今 < ANSWER_TAIL 时不回退；
+/// C 不复活空闲会话——会话不在忙态表时不生效（防断线重连后的回放把已结束会话标成忙）。
+fn to_thinking(
+    sessions: &mut HashMap<String, SessionState>,
+    last_answer: &HashMap<String, Instant>,
+    sid: &str,
+) {
+    if !sessions.contains_key(sid) {
+        return; // C
+    }
+    if sessions.get(sid) == Some(&SessionState::Approval) {
+        return; // A
+    }
+    if matches!(sessions.get(sid), Some(SessionState::Answering))
+        && last_answer.get(sid).map_or(false, |t| t.elapsed() < ANSWER_TAIL)
+    {
+        return; // B
+    }
+    sessions.insert(sid.to_string(), SessionState::Thinking);
+}
+
+/// 会话离开忙态表时，同步清理它的 v2 帧表和正文时间戳。
+fn drop_session(
+    sessions: &mut HashMap<String, SessionState>,
+    frames: &mut HashMap<String, HashMap<String, bool>>,
+    last_answer: &mut HashMap<String, Instant>,
+    sid: &str,
+) {
+    sessions.remove(sid);
+    frames.remove(sid);
+    last_answer.remove(sid);
+}
+
 /// 记录断线时刻：宽限期内保持原状态，超过 OFFLINE_GRACE 仍未恢复才置为离线。
 /// 自动关闭生效时，持续失联超过 AUTO_QUIT_AFTER 视为 Kimi Code 已退出，结束进程。
 fn mark_disconnected(app: &AppHandle, since: &mut Option<Instant>) {
@@ -376,11 +429,24 @@ pub async fn run(app: AppHandle) {
             });
             if let Err(e) = ws_write.send(Message::text(frame.to_string())).await {
                 eprintln!("[kimi-pet] 订阅帧发送失败：{e}");
+            } else {
+                // 叠加 subscribe_v2：新版服务用 transcript 增量驱动「编辑中」
+                for id in &ids {
+                    let sv2 = sv2_frame(id);
+                    if let Err(e) = ws_write.send(Message::text(sv2.to_string())).await {
+                        eprintln!("[kimi-pet] subscribe_v2 发送失败（{id}）：{e}");
+                        break;
+                    }
+                }
             }
         }
         let mut subscribed: HashSet<String> = ids.into_iter().collect();
 
         let mut sessions: HashMap<String, SessionState> = HashMap::new();
+        // v2 帧表：session_id →（frame_id → 是否 assistant 正文帧）
+        let mut frames: HashMap<String, HashMap<String, bool>> = HashMap::new();
+        // 每个会话最后一次收到正文帧/append 的时刻（Answering 防抖判定用）
+        let mut last_answer: HashMap<String, Instant> = HashMap::new();
         set_state(&app, PetState::Idle);
         let mut poll = tokio::time::interval(POLL_INTERVAL);
         let mut rest_failures: u32 = 0;
@@ -420,6 +486,20 @@ pub async fn run(app: AppHandle) {
                         continue;
                     }
 
+                    // subscribe_v2 的 ack：code 非 0 表示服务端不支持（旧版服务），
+                    // 忽略即可，「编辑中」继续靠 streaming phase 推断
+                    if event_type == "ack" {
+                        if let Some(id) = event.get("id").and_then(|v| v.as_str()) {
+                            if id.starts_with("sv2-") {
+                                let code = event.get("code").and_then(|v| v.as_u64()).unwrap_or(0);
+                                if code != 0 {
+                                    eprintln!("[kimi-pet] subscribe_v2 不受支持（{id}，code={code}），退回 phase 推断");
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
                     // 全局事件：新会话创建时补订阅
                     if event_type == "event.session.created" {
                         let new_id = event
@@ -437,6 +517,11 @@ pub async fn run(app: AppHandle) {
                                     eprintln!("[kimi-pet] 补订阅 {id} 失败：{e}");
                                 } else {
                                     subscribed.insert(id.to_string());
+                                    // 叠加 subscribe_v2（新版服务的 transcript 增量）
+                                    let sv2 = sv2_frame(id);
+                                    if let Err(e) = ws_write.send(Message::text(sv2.to_string())).await {
+                                        eprintln!("[kimi-pet] 补发 subscribe_v2 失败（{id}）：{e}");
+                                    }
                                 }
                             }
                             None => eprintln!("[kimi-pet] event.session.created 未解析到会话 id：{text}"),
@@ -453,10 +538,110 @@ pub async fn run(app: AppHandle) {
                         "agent.status.updated" => {
                             if let Some(phase) = event.pointer("/payload/phase") {
                                 match map_phase(phase) {
-                                    Some(s) => sessions.insert(session_id.to_string(), s),
-                                    None => sessions.remove(session_id),
+                                    Some(s) => {
+                                        sessions.insert(session_id.to_string(), s);
+                                    }
+                                    None => drop_session(&mut sessions, &mut frames, &mut last_answer, session_id),
                                 };
                                 set_state(&app, aggregate(&sessions));
+                            }
+                        }
+                        // v2 重放快照开始：清空该会话的帧表
+                        "transcript.reset" => {
+                            frames.remove(session_id);
+                        }
+                        // v2 transcript 增量：正文帧/正文 append → 编辑中，其余忙信号 → 思考中
+                        "transcript.ops" => {
+                            if let Some(ops) = event.pointer("/payload/ops").and_then(|v| v.as_array()) {
+                                let sid = session_id.to_string();
+                                for op in ops {
+                                    match op.get("op").and_then(|v| v.as_str()) {
+                                        Some("frame.upsert") => {
+                                            let Some(frame) = op.get("frame") else { continue };
+                                            let Some(frame_id) = frame.get("frameId").and_then(|v| v.as_str()) else { continue };
+                                            match frame.get("kind").and_then(|v| v.as_str()) {
+                                                // assistant 正文帧 → 编辑中（置 Answering 只过守卫 A）
+                                                Some("text") => {
+                                                    if frame.get("role").and_then(|v| v.as_str()) == Some("assistant") {
+                                                        frames.entry(sid.clone()).or_default().insert(frame_id.to_string(), true);
+                                                        if sessions.get(&sid) != Some(&SessionState::Approval) {
+                                                            sessions.insert(sid.clone(), SessionState::Answering);
+                                                            last_answer.insert(sid.clone(), Instant::now());
+                                                        }
+                                                    }
+                                                    // role=="user" 的正文忽略
+                                                }
+                                                // 思考帧/工具调用帧：思考中（append 到这些帧同样按思考处理）
+                                                Some("thinking") | Some("tool_call") => {
+                                                    frames.entry(sid.clone()).or_default().insert(frame_id.to_string(), false);
+                                                    to_thinking(&mut sessions, &last_answer, &sid);
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                        // 增量文本：append 本身不带帧类型，查帧表回查
+                                        Some("append") => {
+                                            if op.pointer("/target/type").and_then(|v| v.as_str()) != Some("frame") {
+                                                continue;
+                                            }
+                                            let Some(frame_id) = op.pointer("/target/frameId").and_then(|v| v.as_str()) else { continue };
+                                            match frames.get(&sid).and_then(|t| t.get(frame_id)) {
+                                                Some(true) => {
+                                                    if sessions.get(&sid) != Some(&SessionState::Approval) {
+                                                        sessions.insert(sid.clone(), SessionState::Answering);
+                                                        last_answer.insert(sid.clone(), Instant::now());
+                                                    }
+                                                }
+                                                Some(false) => to_thinking(&mut sessions, &last_answer, &sid),
+                                                None => {}
+                                            }
+                                        }
+                                        // step 状态：running 与终态都按思考中处理（受守卫约束）
+                                        Some("step.upsert") => {
+                                            to_thinking(&mut sessions, &last_answer, &sid);
+                                        }
+                                        Some("turn.upsert") => {
+                                            match op.pointer("/turn/state").and_then(|v| v.as_str()) {
+                                                // 排队/进行中：不在表则插入思考中
+                                                // （重放快照里的旧 turn 都是终态，不会误插）
+                                                Some("queued") | Some("running") => {
+                                                    sessions.entry(sid.clone()).or_insert(SessionState::Thinking);
+                                                }
+                                                // 终态：会话收尾
+                                                Some("completed") | Some("failed") | Some("cancelled") => {
+                                                    drop_session(&mut sessions, &mut frames, &mut last_answer, &sid);
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                        Some("interaction.upsert") => {
+                                            match op.pointer("/interaction/status").and_then(|v| v.as_str()) {
+                                                Some("pending") => {
+                                                    sessions.insert(sid.clone(), SessionState::Approval);
+                                                }
+                                                // 非 pending 视为已处理：回到思考中（受守卫约束）
+                                                _ => to_thinking(&mut sessions, &last_answer, &sid),
+                                            }
+                                        }
+                                        // prompt.upsert / marker.upsert / meta.merge / task.upsert 等一律忽略
+                                        _ => {}
+                                    }
+                                }
+                                set_state(&app, aggregate(&sessions));
+                            }
+                        }
+                        // 会话级工作信号：不忙了即收尾，忙则补占位
+                        "event.session.work_changed" => {
+                            match event.pointer("/payload/busy").and_then(|v| v.as_bool()) {
+                                Some(false) => {
+                                    drop_session(&mut sessions, &mut frames, &mut last_answer, session_id);
+                                    set_state(&app, aggregate(&sessions));
+                                }
+                                Some(true) => {
+                                    sessions.entry(session_id.to_string()).or_insert(SessionState::Thinking);
+                                    set_state(&app, aggregate(&sessions));
+                                }
+                                None => {}
                             }
                         }
                         // 待审核
@@ -472,7 +657,7 @@ pub async fn run(app: AppHandle) {
                         }
                         // 轮次结束
                         "turn.ended" | "turn.step.interrupted" | "error" => {
-                            sessions.remove(session_id);
+                            drop_session(&mut sessions, &mut frames, &mut last_answer, session_id);
                             set_state(&app, aggregate(&sessions));
                         }
                         _ => {}
@@ -484,6 +669,9 @@ pub async fn run(app: AppHandle) {
                         Some(infos) => {
                             rest_failures = 0;
                             if reconcile(&mut sessions, &infos) {
+                                // 同步清理已被 reconcile 移除（空闲）的会话的 v2 附属表
+                                frames.retain(|sid, _| sessions.contains_key(sid));
+                                last_answer.retain(|sid, _| sessions.contains_key(sid));
                                 set_state(&app, aggregate(&sessions));
                             }
                             let new_ids: Vec<String> = infos
@@ -499,8 +687,34 @@ pub async fn run(app: AppHandle) {
                                 if let Err(e) = ws_write.send(Message::text(frame.to_string())).await {
                                     eprintln!("[kimi-pet] 补订阅失败：{e}");
                                 } else {
-                                    subscribed.extend(new_ids);
+                                    subscribed.extend(new_ids.iter().cloned());
+                                    // 叠加 subscribe_v2（新版服务的 transcript 增量）
+                                    for id in &new_ids {
+                                        let sv2 = sv2_frame(id);
+                                        if let Err(e) = ws_write.send(Message::text(sv2.to_string())).await {
+                                            eprintln!("[kimi-pet] 补发 subscribe_v2 失败（{id}）：{e}");
+                                            break;
+                                        }
+                                    }
                                 }
+                            }
+                            // v2 防抖：Answering 的正文 delta 停更超过 ANSWER_TAIL 后回落为思考中。
+                            // 只处理有 last_answer 时间戳的会话（经 v2 进入编辑中），
+                            // 旧版 streaming phase 进入的编辑中不受影响
+                            let now = Instant::now();
+                            let mut stale: Vec<String> = Vec::new();
+                            for (sid, st) in sessions.iter() {
+                                if *st == SessionState::Answering
+                                    && last_answer.get(sid).map_or(false, |t| now.duration_since(*t) >= ANSWER_TAIL)
+                                {
+                                    stale.push(sid.clone());
+                                }
+                            }
+                            if !stale.is_empty() {
+                                for sid in stale {
+                                    sessions.insert(sid, SessionState::Thinking);
+                                }
+                                set_state(&app, aggregate(&sessions));
                             }
                         }
                         // 连续失败 = 服务假死（kimi web 优雅关停卡死时进程还在但不再响应，
